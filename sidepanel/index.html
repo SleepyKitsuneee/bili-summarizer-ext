@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>B站视频 → 总结</h1>
+  <span id="badge" class="badge">就绪</span>
+</header>
+
+<section class="card input-card">
+  <div class="go-wrap">
+    <button id="go" class="pill primary full" disabled>开始总结</button>
+    <div id="go-hint" class="hint">正在检测当前页面…</div>
+  </div>
+</section>
+
+<section id="steps" class="card steps hidden">
+  <div id="step-title" class="step-title">—</div>
+  <div class="bar"><div id="bar-fill" class="bar-fill"></div></div>
+  <ul id="step-list"></ul>
+  <div id="err-banner" class="err-banner hidden"></div>
+</section>
+
+<section id="result" class="card result hidden">
+  <h2 id="r-title">总结</h2>
+  <div id="r-quote" class="quote hidden"></div>
+  <div id="r-meta" class="meta hidden"></div>
+  <div id="r-body"></div>
+</section>
+
+<section class="card">
+  <div class="hist-head">
+    <h2>历史记录</h2>
+    <button id="refresh" class="mini">刷新</button>
+  </div>
+  <ul id="hist" class="hist"></ul>
+  <div id="hist-empty" class="empty">还没有总结记录</div>
+</section>
+
+<section class="card">
+  <div class="hist-head">
+    <h2>设置</h2>
+    <button id="toggle-settings" class="mini">展开</button>
+  </div>
+  <div id="settings" class="hidden">
+    <div class="field">
+      <label for="model">模型（必须用能读视频的 omni 模型）</label>
+      <div class="field-row">
+        <input id="model" list="model-list" type="text" spellcheck="false" placeholder="Qwen3.8-Omni-Flash">
+        <datalist id="model-list"></datalist>
+        <button id="refresh-models" class="mini">读取列表</button>
+      </div>
+      <div id="model-tip" class="tip">点「读取列表」从已打开的千问页面实时拉取可选项</div>
+    </div>
+    <div class="field">
+      <label for="prompt">提示词前置说明</label>
+      <textarea id="prompt" rows="7" spellcheck="false"></textarea>
+      <div class="tip">最终提示词 = 这段说明 + 固定 JSON 结构（结构定义在 summary_schema.json）</div>
+    </div>
+    <div class="field-row btns">
+      <button id="save-settings" class="pill primary">保存</button>
+      <button id="reset-settings" class="pill">恢复默认</button>
+    </div>
+    <div id="settings-saved" class="tip ok hidden">已保存</div>
+  </div>
+</section>
+
+<section class="card">
+  <div class="hist-head">
+    <h2>日志</h2>
+    <button id="toggle-log" class="mini">展开</button>
+  </div>
+  <div id="log-body" class="hidden">
+    <div class="field-row btns">
+      <button id="log-refresh" class="mini">刷新</button>
+      <button id="log-copy" class="mini">复制全部</button>
+      <button id="log-clear" class="mini">清空</button>
+    </div>
+    <div id="log-empty" class="empty">暂无日志。开始一次总结后，这里会记录完整流程（含失败原因），可复制发出去排查。</div>
+    <pre id="log-view" class="log-view hidden"></pre>
+  </div>
+</section>
+
+<footer>
+  <span>360P+64K · ffmpeg.wasm 本地合流 · 千问 omni</span>
+</footer>
+
+<script src="panel.js"></script>
+</body>
+</html>
