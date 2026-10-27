@@ -2,7 +2,7 @@
 // 协议变更：offscreen 通信全部走 chrome.runtime 消息（实测 client.postMessage 通道不通）。
 // 多标签页并行：每个标签页独立任务状态；千问页面阶段全局排队，其余阶段并行。
 import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid, setLog as setBiliLog } from './lib/bilibili.js';
-import { pollAnswer, setLog as setQwenLog } from './lib/qwen.js';
+import { pollAnswer, probeChat, setLog as setQwenLog } from './lib/qwen.js';
 import { u8ToB64, b64ToU8 } from './lib/b64.js';
 import { cdpEnsureActive } from './lib/cdp.js';
 import { parseSummaryJson } from './lib/json.js';
@@ -375,6 +375,16 @@ async function finishGeneration(meta, chatId) {
   const gT0 = Date.now();
   try {
     report(meta.taskTabId, 'AI 生成', '正在等待生成结果…');
+    // 开跑前先探一次：chatId 无效 / 接口结构变了，在这里就能立刻暴露，
+    // 不用等 25 分钟超时（历史故障：175 次轮询全是「没有 assistant 消息」）。
+    const probe = await probeChat(chatId);
+    if (probe.ok) {
+      logRun(`[探针] chatId=${chatId} 有效 · 消息字段=${probe.messageKey || '未找到'}`
+        + ` · 共 ${probe.total} 条 · assistant ${probe.assistants} 条`
+        + (probe.assistants ? '' : '（尚未开始生成，正常）'), 'INFO', 'GEN');
+    } else {
+      logRun(`[探针] chatId=${chatId} 校验失败：${probe.error}`, 'WARN', 'GEN');
+    }
     const { text, model } = await pollAnswer(chatId, {
       onTick: (len, m) => {
         report(meta.taskTabId, 'AI 生成', `已生成 ${len} 字（${m}）`);

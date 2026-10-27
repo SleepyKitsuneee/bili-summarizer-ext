@@ -124,6 +124,20 @@ background.js（任务编排，每个标签页独立）
 
 ## 更新日志
 
+### v0.7.1（2026-10-27）
+
+**修复**
+
+- 修复「查不到 assistant 消息」时干等 25 分钟：连续 30 次（约 4 分钟）拿不到 assistant 消息即早退报错，并在错误里带上 chatId、消息字段名、会话消息条数。
+- 修复早退异常被 `catch` 吞掉导致无法退出：改用致命标志在循环外抛出。
+
+**新增**
+
+- 轮询前先探一次 chatId：1 秒内确认会话是否有效、消息字段在哪、有几条 assistant 消息，不再盲等。
+- `fetchChat` 支持诊断模式，记录顶层/data/chat 的字段名、消息字段、roles 分布、末条消息字段。
+- 消息数组自动兜底（`findMessageArray`）：`messages` 被改名或换层级时，靠 `role`/`content_list` 特征自动识别，并提示「接口结构可能已变」。
+- 新增 `test-find-messages.mjs`、`test-empty-earlyexit.mjs` 两个测试。
+
 ### v0.7.0（2026-10-27）
 
 **修复**
