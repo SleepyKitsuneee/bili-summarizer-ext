@@ -156,7 +156,32 @@ function report(tabId, step, detail = '') {
     if (detail) s.details[step] = detail;
     if (step === '读取视频信息' && detail) s.stepTitle = detail;
   }
-  logRun(`[进度] 标签页${tabId} · ${step}${detail ? ' · ' + detail : ''}`, step === '失败' ? 'ERROR' : 'INFO', 'STEP');
+  // 进度日志去重 + 降频：下载/合流进度每 1% 都会回调，逐条记会把日志刷爆
+  //（实测一次任务 2537 行里 600+ 行是「视频 0%/1%/2%…」，加上音频/合流/传输共 1010 行）。
+  // 规则：
+  //   · 百分比类进度每 10% 记一行（0/10/20…/100）
+  //   · 用「阶段+前缀」做独立游标，视频/音频/合流/传输互不干扰
+  //   · 其他 detail 变化时才记
+  //   · 失败/完成永远记
+  const PCT_STEP = 10;
+  const pctMatch = detail.match(/^(\D*)(\d+)%$/);
+  let shouldLog;
+  if (pctMatch) {
+    const pct = parseInt(pctMatch[2], 10);
+    const bucket = Math.floor(pct / PCT_STEP) * PCT_STEP;
+    const key = `${step}|${pctMatch[1]}`;                 // 例：下载视频|视频
+    if (!s._pctCursors) s._pctCursors = {};
+    shouldLog = s._pctCursors[key] !== bucket;             // 每个前缀独立比较档位
+    if (shouldLog) s._pctCursors[key] = bucket;
+  } else {
+    shouldLog = s._lastLogKey !== `${step}|${detail}`;
+    if (shouldLog) s._lastLogKey = `${step}|${detail}`;
+  }
+  if (step === '失败' || step === '完成') shouldLog = true;   // 关键节点永远记
+  if (shouldLog) {
+    logRun(`[进度] 标签页${tabId} · ${step}${detail ? ' · ' + detail : ''}`,
+      step === '失败' ? 'ERROR' : 'INFO', 'STEP');
+  }
   if (step === '完成' || step === '失败') {
     flushState(tabId);                               // 关键节点立刻落盘
     // 日志：先把队列推完，再请 sidepanel 写文件（SW 自己写不了文件）
@@ -382,8 +407,10 @@ async function finishGeneration(meta, chatId) {
       logRun(`[探针] chatId=${chatId} 有效 · 消息字段=${probe.messageKey || '未找到'}`
         + ` · 共 ${probe.total} 条 · assistant ${probe.assistants} 条`
         + (probe.assistants ? '' : '（尚未开始生成，正常）'), 'INFO', 'GEN');
+    } else if (probe.bizError) {
+      logRun(`[探针] chatId=${chatId} 接口报业务错误：${probe.error}`, 'ERROR', 'GEN');
     } else {
-      logRun(`[探针] chatId=${chatId} 校验失败：${probe.error}`, 'WARN', 'GEN');
+      logRun(`[探针] chatId=${chatId} 校验未通过：${probe.error}`, 'WARN', 'GEN');
     }
     const { text, model } = await pollAnswer(chatId, {
       onTick: (len, m) => {
