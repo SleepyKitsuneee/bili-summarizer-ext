@@ -1,4 +1,4 @@
-test_script/
+test_script/test-assets/
 *.zip
 debug.log
 debug-*.log
