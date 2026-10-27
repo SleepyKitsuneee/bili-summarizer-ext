@@ -42,7 +42,7 @@ async function loadCore() {
   return corePromise;
 }
 
-async function doMerge(taskId, video, audio) {
+async function doMerge(taskId, video, audio, opts = {}) {
   const c = await loadCore();
   ffLogs.length = 0;
   const vName = `in.${taskId}.video.m4s`;
@@ -54,9 +54,17 @@ async function doMerge(taskId, video, audio) {
   let ret;
   const t0 = Date.now();
   try {
+    // 默认 -c copy（无损、秒完成）。
+    // 但如果源视频不是 AVC（HEVC/AV1），千问的 omni 模型解不了，会报「输入或附件无效」，
+    // 这时按需转成 H.264（forceAvc=true，由 background 根据 codecs 判断后传入）。
+    const videoArgs = opts.forceAvc
+      ? ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-pix_fmt', 'yuv420p']
+      : ['-c:v', 'copy'];
+    olog(`[${taskId}] 视频处理方式：${opts.forceAvc ? '转码 H.264（源编码非 AVC）' : '-c copy'}`);
     ret = c.exec('-hide_banner', '-loglevel', 'info',
       '-i', vName, '-i', aName,
-      '-c', 'copy', '-map', '0:v:0', '-map', '1:a:0',
+      ...videoArgs, '-c:a', 'copy', '-map', '0:v:0', '-map', '1:a:0',
+      '-movflags', '+faststart',
       '-y', oName);
   } catch (e) {
     ffLogs.push('exec 异常: ' + (e?.message ?? e));
@@ -157,7 +165,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           for (const c of side.chunks) { full.set(c, off); off += c.byteLength; }
           return full.buffer;
         };
-        const r = await doMerge(msg.taskId, join(job.v), join(job.a));
+        const r = await doMerge(msg.taskId, join(job.v), join(job.a), { forceAvc: !!msg.forceAvc });
         if (r.ok) await sendResult(msg.taskId, r.buffer);
         else await chrome.runtime.sendMessage({ type: 'FF_FAILED', taskId: msg.taskId, error: r.error });
       } catch (e) {

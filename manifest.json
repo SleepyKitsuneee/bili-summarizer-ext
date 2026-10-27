@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "B站视频总结助手（本地版）",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "description": "给链接就出总结：360P+64K 下载 → 本地 ffmpeg.wasm 合流 → 后台静默上传千问 → omni 模型结构化总结。全程本地处理视频，使用你自己的千问登录态。",
   "permissions": [
     "storage",

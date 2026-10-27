@@ -251,7 +251,7 @@ async function sendChunks(type, taskId, u8, which, onProgress) {
   }
 }
 
-async function offscreenMerge(taskId, vBuf, aBuf, onProgress) {
+async function offscreenMerge(taskId, vBuf, aBuf, onProgress, opts = {}) {
   await ensureOffscreen();
   const v = new Uint8Array(vBuf), a = new Uint8Array(aBuf);
   const job = { b64s: [] };
@@ -264,7 +264,7 @@ async function offscreenMerge(taskId, vBuf, aBuf, onProgress) {
     await chrome.runtime.sendMessage({ type: 'FF_BEGIN', taskId, vTotal: Math.ceil(v.byteLength / FF_CHUNK), aTotal: Math.ceil(a.byteLength / FF_CHUNK) });
     await sendChunks('FF_MERGE_CHUNK', taskId, v, 'video', (p) => { sentBytes += v.byteLength / Math.ceil(v.byteLength / FF_CHUNK); onProgress?.(sentBytes / totalBytes); });
     await sendChunks('FF_MERGE_CHUNK', taskId, a, 'audio', (p) => { sentBytes += a.byteLength / Math.ceil(a.byteLength / FF_CHUNK); onProgress?.(sentBytes / totalBytes); });
-    await chrome.runtime.sendMessage({ type: 'FF_MERGE_RUN', taskId });
+    await chrome.runtime.sendMessage({ type: 'FF_MERGE_RUN', taskId, forceAvc: !!opts.forceAvc });
     return await doneP;
   } finally {
     clearTimeout(timer);
@@ -549,6 +549,12 @@ async function runTask(url, tabId) {
     const { video, audio } = pickStreams(dash, 16);
     if (!audio) throw new Error('没有可用的音频流');
     logRun(`[下载] 选流：视频 id=${video.id} codecs=${video.codecs} 带宽=${video.bandwidth}｜音频 id=${audio.id} 带宽=${audio.bandwidth}`, 'INFO', 'DASH');
+    // 千问的 omni 模型解不了 HEVC/AV1，传上去只会得到「输入或附件无效」。
+    // 选流已经优先 AVC，这里再兜一层：万一站点只给了非 AVC，提前报清楚。
+    const codecs = String(video.codecs || '');
+    if (codecs && !codecs.startsWith('avc')) {
+      logRun(`[下载] 警告：选中流的编码是 ${codecs}（非 AVC），千问可能无法解码`, 'WARN', 'DASH');
+    }
     logRun(`[下载] 视频URL=${(video.baseUrl || video.base_url || '').slice(0, 100)}`, 'DEBUG', 'DASH');
     logRun(`[下载] 音频URL=${(audio.baseUrl || audio.base_url || '').slice(0, 100)}`, 'DEBUG', 'DASH');
     let vBuf = await downloadStream(video.baseUrl || video.base_url,
@@ -562,7 +568,8 @@ async function runTask(url, tabId) {
     logRun(`[合流] 任务 ${mergeTaskId}：视频 ${vBuf.byteLength}B + 音频 ${aBuf.byteLength}B`, 'INFO', 'FF');
     const mT0 = Date.now();
     let merged = await offscreenMerge(mergeTaskId, vBuf, aBuf,
-      (p) => report(tabId, '本地合流', `合流 ${Math.round(p * 100)}%`));
+      (p) => report(tabId, '本地合流', `合流 ${Math.round(p * 100)}%`),
+      { forceAvc: !String(video.codecs || '').startsWith('avc') });
     logRun(`[合流] 产物 ${(merged.byteLength / 1024 / 1024).toFixed(2)}MB · 耗时 ${((Date.now() - mT0) / 1000).toFixed(1)}s`, 'INFO', 'FF');
     vBuf = aBuf = null;
 
