@@ -217,9 +217,13 @@ async function waitParsed(maxMs = 5 * 60_000) {
     await sleep(2000);
     const c = findAttachCard();
     if (!c) continue;
-    if (!/loading|spin|uploading|progress/i.test(c.outerHTML)) return;
+    if (!/loading|spin|uploading|progress/i.test(c.outerHTML)) {
+      qlog(`服务端解析完成（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
+      return;
+    }
   }
   // 5 分钟仍在加载态：选择器可能误报，别死等，放行走发送流程
+  qlog(`等待解析超过 ${(maxMs / 1000).toFixed(0)}s，卡片仍处加载态，放行`);
 }
 
 // ── 发送提问 ──
@@ -227,6 +231,7 @@ async function sendPrompt(prompt) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     const ta = $('textarea');
     if (!ta) throw new Error('找不到输入框');
+    qlog(`发送提问第 ${attempt}/2 次 · 提示词 ${prompt.length} 字`);
     ta.focus();
     await sleep(300);
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
@@ -236,13 +241,14 @@ async function sendPrompt(prompt) {
     ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true }));
     ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
     await sleep(5000);
-    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) return;
+    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) { qlog('回车发送成功，已进入会话页'); return; }
     // 兜底：回车没触发就点发送按钮
     const sendBtn = $('button[aria-label*="发送"], button[aria-label*="Send"], .send-button, #send-message-button')
       || $$('button').find(b => /发送|Send/.test(b.getAttribute('aria-label') || b.innerText || ''));
-    if (sendBtn) { sendBtn.click(); await sleep(4000); }
-    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) return;
-    console.log('[qwen-driver] 第', attempt, '次发送未进入会话页');
+    if (sendBtn) { qlog('回车无效，改点发送按钮'); sendBtn.click(); await sleep(4000); }
+    else qlog('回车无效且没找到发送按钮');
+    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) { qlog('按钮发送成功，已进入会话页'); return; }
+    qlog(`第 ${attempt} 次发送未进入会话页，当前路径 ${location.pathname}`);
   }
   throw new Error('发送失败：未进入会话页');
 }

@@ -23,6 +23,18 @@ async function loadCore() {
       // 注意：不能传 print/printErr！传入会覆盖 core 自带的 logger 版 print，
       // ffmpeg 输出会全部进空函数。日志统一走 setLogger。
       const c = await createFFmpegCore({ wasmBinary: wasm });
+      // 用 setLogger 拿全量 stderr（传 print/printErr 会覆盖 core 自带 logger，反而丢掉输出）
+      if (typeof c.setLogger === 'function') {
+        c.setLogger((m) => {
+          const line = String(m ?? '').trim();
+          if (!line) return;
+          ffLogs.push(line);
+          if (ffLogs.length > 400) ffLogs.splice(0, ffLogs.length - 400);
+        });
+        olog('ffmpeg logger 已接入（setLogger）');
+      } else {
+        olog('警告：core 没有 setLogger，ffmpeg 输出将无法捕获');
+      }
       olog(`wasm 引擎就绪（${Date.now() - t0}ms，wasm ${(wasm.byteLength / 1024 / 1024).toFixed(1)}MB）`);
       return (core = c);
     })();
@@ -55,10 +67,14 @@ async function doMerge(taskId, video, audio) {
   if (ret !== 0) {
     let fsList = [];
     try { fsList = c.FS.readdir('/'); } catch {}
-    return { ok: false, error: `ffmpeg 退出码 ${ret}｜FS:[${fsList.join(',')}]｜日志: ${ffLogs.slice(-25).join(' ⏎ ')}` };
+    // 失败时把完整 ffmpeg 日志分批发回后台（之前只留最后 25 行，排错时不够用）
+    for (const line of ffLogs) olog(`[${taskId}][ffmpeg] ${line}`);
+    return { ok: false, error: `ffmpeg 退出码 ${ret}｜FS:[${fsList.join(',')}]｜日志共 ${ffLogs.length} 行（已逐行上报）` };
   }
+  // 成功也留一条关键统计（时长/码率/流信息通常在最后几行）
+  for (const line of ffLogs.slice(-8)) olog(`[${taskId}][ffmpeg] ${line}`);
   const out = c.FS.readFile(oName);
-  olog(`[${taskId}] 产物 ${out.byteLength}B，分块回传给后台…`);
+  olog(`[${taskId}] 产物 ${(out.byteLength / 1024 / 1024).toFixed(2)}MB（${out.byteLength}B），分块回传给后台…`);
   try { c.FS.unlink(oName); } catch {}
   return { ok: true, buffer: out.buffer };
 }
@@ -70,12 +86,17 @@ const mergeJobs = new Map();   // taskId -> {v:{total,chunks,got}, a:{...}}
 async function sendResult(taskId, buffer) {
   const u8 = new Uint8Array(buffer);
   const total = Math.ceil(u8.byteLength / CHUNK);
+  const t0 = Date.now();
   for (let seq = 0; seq < total; seq++) {
     const b64 = u8ToB64(u8.subarray(seq * CHUNK, (seq + 1) * CHUNK));
     const r = await chrome.runtime.sendMessage({ type: 'FF_RESULT_CHUNK', taskId, seq, total, b64 });
     if (!r?.ok) throw new Error('SW 未确认结果块 ' + seq);
+    if (total <= 12 || (seq + 1) % 10 === 0 || seq + 1 === total) {
+      olog(`[${taskId}] 回传 ${seq + 1}/${total} 块 · ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    }
   }
   await chrome.runtime.sendMessage({ type: 'FF_RESULT_END', taskId, size: u8.byteLength });
+  olog(`[${taskId}] 回传完毕 ${total} 块 · 共 ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 }
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {

@@ -81,6 +81,17 @@
     </div>
     <div id="log-empty" class="empty">暂无日志。开始一次总结后，这里会记录完整流程（含失败原因），可复制发出去排查。</div>
     <pre id="log-view" class="log-view hidden"></pre>
+
+    <div class="hist-head" style="margin-top:14px">
+      <h2 style="font-size:13px">本地日志文件</h2>
+      <button id="logfile-pick" class="mini">选择目录</button>
+    </div>
+    <div id="logfile-status" class="tip">未配置。点「选择目录」并选中 bili-ext 文件夹，日志会追加到 debug.log。</div>
+    <div class="field-row btns" style="margin-top:8px">
+      <button id="logfile-flush" class="mini">立即写入</button>
+      <button id="logfile-clear" class="mini">清空文件</button>
+    </div>
+    <div id="logfile-saved" class="tip ok hidden"></div>
   </div>
 </section>
 
@@ -88,6 +99,6 @@
   <span>360P+64K · ffmpeg.wasm 本地合流 · 千问 omni</span>
 </footer>
 
-<script src="panel.js"></script>
+<script type="module" src="panel.js"></script>
 </body>
 </html>

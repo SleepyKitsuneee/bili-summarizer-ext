@@ -1,3 +1,4 @@
-test/
 test-assets/
 *.zip
+debug.log
+debug-*.log

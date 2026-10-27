@@ -1,10 +1,12 @@
 // background.js —— 任务编排（v0.1.2）
 // 协议变更：offscreen 通信全部走 chrome.runtime 消息（实测 client.postMessage 通道不通）。
 // 多标签页并行：每个标签页独立任务状态；千问页面阶段全局排队，其余阶段并行。
-import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid } from './lib/bilibili.js';
-import { pollAnswer } from './lib/qwen.js';
+import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid, setLog as setBiliLog } from './lib/bilibili.js';
+import { pollAnswer, setLog as setQwenLog } from './lib/qwen.js';
 import { u8ToB64, b64ToU8 } from './lib/b64.js';
 import { cdpEnsureActive } from './lib/cdp.js';
+import { parseSummaryJson } from './lib/json.js';
+import * as dlog from './lib/dlog.js';
 
 const OFFSCREEN = 'offscreen/offscreen.html';
 const QWEN_HOME = 'https://chat.qwen.ai/';
@@ -28,17 +30,47 @@ const DEFAULT_PREAMBLE = [
 const STEPS = ['读取视频信息', '下载视频', '本地合流', '上传到千问', '发送给模型', 'AI 生成'];
 const FF_CHUNK = 4 * 1024 * 1024;
 
-// ── 运行日志（事无巨细，供排错复制；存 session，SW 重启不丢，上限 1200 行）──
+// ── 运行日志 ──
+// 三路输出，各有分工：
+//   1) runLog 内存数组   → 侧边栏「日志」面板实时看（上限 1500 行）
+//   2) chrome.storage.session → SW 重启不丢（浏览器退出清空）
+//   3) lib/dlog.js 队列  → sidepanel 刷进本地 bili-ext\debug.log（永久保留）
+// 格式：HH:MM:SS.mmm|LVL|TAG|tab<id>|消息 —— 单行，方便 grep。
 let runLog = [];
-const LOG_MAX = 1200;
+const LOG_MAX = 1500;
+const LOG_LINE_MAX = 4000;          // 单行上限（ffmpeg stderr / 模型原文需要长一些）
 let logSaveTimer = null;
-function logRun(msg) {
+function logRun(msg, level = 'INFO', tag = '') {
   const t = new Date();
   const ts = t.toTimeString().slice(0, 8) + '.' + String(t.getMilliseconds()).padStart(3, '0');
-  runLog.push(`[${ts}] ${String(msg).slice(0, 500)}`);
+  let body = String(msg);
+  if (body.length > LOG_LINE_MAX) {
+    body = body.slice(0, LOG_LINE_MAX) + `…（截断，原长 ${String(msg).length}）`;
+  }
+  // 消息自带 [xx] 前缀时沿用它当 TAG，省得每个调用点都传参
+  let useTag = tag;
+  const m = body.match(/^\[([^\]]{1,20})\]\s*/);
+  if (!useTag && m) { useTag = m[1]; body = body.slice(m[0].length); }
+  const line = `${ts}|${level}|${useTag || 'LOG'}|${body}`;
+  runLog.push(line);
   if (runLog.length > LOG_MAX) runLog.splice(0, runLog.length - LOG_MAX);
+  dlog.enqueue(line);                                   // 进落盘队列
+  // ERROR 级立刻推盘：SW 可能随时被回收，错误现场最不能丢
+  if (level === 'ERROR') dlog.flushBuffer().catch(() => {});
   clearTimeout(logSaveTimer);
   logSaveTimer = setTimeout(() => chrome.storage.session.set({ runlog: runLog }).catch(() => {}), 300);
+}
+const logInfo = (msg, tag) => logRun(msg, 'INFO', tag);
+const logWarn = (msg, tag) => logRun(msg, 'WARN', tag);
+const logErr = (msg, tag) => logRun(msg, 'ERROR', tag);
+// 把 logRun 注入 lib 层（避免 lib 反向 import background 造成循环依赖）
+setBiliLog((m) => logRun(m, 'DEBUG', 'NET'));
+setQwenLog((m) => logRun(m, 'DEBUG', 'QWEN'));
+// 异常专用：连 stack 一起记，只看 message 往往定位不到行号
+function logEx(prefix, e, tag = 'EXC') {
+  const msg = e?.message ?? e;
+  const stack = String(e?.stack || '').split('\n').slice(0, 6).join(' ⏎ ');
+  logRun(`${prefix}：${msg}${stack ? ' ⏎ ' + stack : ''}`, 'ERROR', tag);
 }
 async function loadRunLog() {
   if (runLog.length) return runLog;
@@ -46,11 +78,15 @@ async function loadRunLog() {
   if (got && Array.isArray(got.runlog)) runLog = got.runlog;
   return runLog;
 }
-// SW 冷启动：恢复日志并打生命周期标记
+// SW 冷启动：恢复日志并打生命周期标记（含环境快照，出问题时能确认版本/UA）
 (async () => {
   try {
     await loadRunLog();
-    logRun('── SW 启动/唤醒（内存已清空，以下为新生命周期）──');
+    logRun('── SW 启动/唤醒（内存已清空，以下为新生命周期）──', 'INFO', 'BOOT');
+    try {
+      const mf = chrome.runtime.getManifest();
+      logRun(`扩展 v${mf.version} · MV${mf.manifest_version} · UA=${navigator.userAgent}`, 'INFO', 'ENV');
+    } catch {}
   } catch {}
 })();
 
@@ -120,9 +156,14 @@ function report(tabId, step, detail = '') {
     if (detail) s.details[step] = detail;
     if (step === '读取视频信息' && detail) s.stepTitle = detail;
   }
-  logRun(`[进度] 标签页${tabId} · ${step}${detail ? ' · ' + detail : ''}`);
-  if (step === '完成' || step === '失败') flushState(tabId);   // 关键节点立刻落盘
-  else scheduleSave(tabId);
+  logRun(`[进度] 标签页${tabId} · ${step}${detail ? ' · ' + detail : ''}`, step === '失败' ? 'ERROR' : 'INFO', 'STEP');
+  if (step === '完成' || step === '失败') {
+    flushState(tabId);                               // 关键节点立刻落盘
+    // 日志：先把队列推完，再请 sidepanel 写文件（SW 自己写不了文件）
+    dlog.flushBuffer()
+      .then(() => chrome.runtime.sendMessage({ type: 'LOG_FLUSH_NOW' }))
+      .catch(() => {});
+  } else scheduleSave(tabId);
   chrome.runtime.sendMessage({ type: 'PROGRESS', tabId, step, detail }).catch(() => {});
 }
 
@@ -330,22 +371,31 @@ async function finishGeneration(meta, chatId) {
   if (resuming) { logRun('[生成] 已有生成阶段在进行，跳过重复调用'); return; }
   resuming = true;
   startKeepalive();
-  logRun(`[生成] 开始轮询答案 chatId=${chatId}（taskTabId=${meta.taskTabId}）`);
+  logRun(`[生成] 开始轮询答案 chatId=${chatId}（taskTabId=${meta.taskTabId}）`, 'INFO', 'GEN');
+  const gT0 = Date.now();
   try {
     report(meta.taskTabId, 'AI 生成', '正在等待生成结果…');
     const { text, model } = await pollAnswer(chatId, {
-      onTick: (len, m) => report(meta.taskTabId, 'AI 生成', `已生成 ${len} 字（${m}）`),
+      onTick: (len, m) => {
+        report(meta.taskTabId, 'AI 生成', `已生成 ${len} 字（${m}）`);
+        logRun(`[生成] 已取到 ${len} 字 · 模型=${m} · 已等待 ${((Date.now() - gT0) / 1000).toFixed(0)}s`, 'DEBUG', 'GEN');
+      },
     });
+    logRun(`[生成] 回答完成：${text.length} 字 · 模型=${model} · 耗时 ${((Date.now() - gT0) / 1000).toFixed(1)}s`, 'INFO', 'GEN');
+    logRun(`[生成] 回答原文：${text.replace(/\s+/g, ' ')}`, 'DEBUG', 'RAW');
     let data = null, err = null;
     try {
-      const t = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
-      data = JSON.parse(t.slice(t.indexOf('{'), t.lastIndexOf('}') + 1));
+      data = parseSummaryJson(text);
+      if (!data) err = '没能从回答里提取出 JSON 对象';
     } catch (e) { err = String(e); }
     if (data) {
+      logRun(`[生成] JSON 解析成功，字段：${Object.keys(data).join('、')}`, 'INFO', 'GEN');
       if (meta.title) data['视频标题'] = meta.title;
       if (meta.up) data['UP主'] = meta.up;
       const m = meta.durationSec;
       if (m) data['时长'] = `${Math.floor(m / 60)}分${m % 60}秒`;
+    } else {
+      logRun(`[生成] JSON 解析失败：${err}`, 'WARN', 'GEN');
     }
     getState(meta.taskTabId).result = data || { 原始回答: text };
     flushState(meta.taskTabId);
@@ -358,6 +408,7 @@ async function finishGeneration(meta, chatId) {
     chrome.runtime.sendMessage({ type: 'TASK_DONE', tabId: meta.taskTabId, ok: !!data, data, err }).catch(() => {});
     await clearActiveTask();
   } catch (e) {
+    logEx('[生成] 失败', e, 'GEN');
     report(meta.taskTabId, '失败', '生成阶段失败：' + String(e?.message ?? e));
     chrome.runtime.sendMessage({ type: 'TASK_FAILED', tabId: meta.taskTabId, error: String(e?.message ?? e) }).catch(() => {});
     await clearActiveTask();
@@ -387,6 +438,8 @@ async function finishGeneration(meta, chatId) {
 async function sendFileToTab(tabId, buf, fileName, onProgress) {
   const u8 = new Uint8Array(buf);
   const total = Math.ceil(u8.byteLength / FF_CHUNK);
+  const t0 = Date.now();
+  let retries = 0;
   for (let seq = 0; seq < total; seq++) {
     const b64 = u8ToB64(u8.subarray(seq * FF_CHUNK, (seq + 1) * FF_CHUNK));
     for (let retry = 0; ; retry++) {
@@ -397,6 +450,8 @@ async function sendFileToTab(tabId, buf, fileName, onProgress) {
         if (r?.ok === false) throw new Error('页面拒绝数据块');
         break;
       } catch (e) {
+        retries++;
+        logRun(`[传输] 块 ${seq + 1}/${total} 失败（第 ${retry + 1} 次）：${e.message}`, 'WARN', 'TX');
         if (retry >= 5) throw new Error('向 qwen 页面传文件失败：' + e.message);
         // 断连自愈：页面被刷新/丢弃时驱动会掉线，重新就绪后继续
         if (/Receiving end|Could not establish/i.test(e.message)) {
@@ -406,9 +461,12 @@ async function sendFileToTab(tabId, buf, fileName, onProgress) {
       }
     }
     onProgress?.(Math.round((seq + 1) / total * 100));
-    logRun(`[传输] 块 ${seq + 1}/${total} → 已确认（${(b64.length / 1024).toFixed(0)}KB base64）`);
+    // 每 10 块（约 40MB）记一行，不再逐块刷屏
+    if (total <= 12 || (seq + 1) % 10 === 0 || seq + 1 === total) {
+      logRun(`[传输] 块 ${seq + 1}/${total} 已确认 · ${(b64.length / 1024).toFixed(0)}KB base64/块 · 累计 ${((Date.now() - t0) / 1000).toFixed(1)}s`, 'DEBUG', 'TX');
+    }
   }
-  logRun(`[传输] 文件 ${fileName} 全部送达（${u8.byteLength}B / ${total} 块）`);
+  logRun(`[传输] 文件 ${fileName} 全部送达（${(u8.byteLength / 1024 / 1024).toFixed(2)}MB / ${total} 块 · 重试 ${retries} 次 · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s）`, 'INFO', 'TX');
   await chrome.tabs.sendMessage(tabId, { type: 'QWEN_FILE_END', id: fileName, total });
 }
 
@@ -436,30 +494,39 @@ async function runTask(url, tabId) {
   s.steps = {}; s.details = {}; s.stepTitle = '';
   startKeepalive();
   const bvid = parseBvid(url);
-  logRun(`[任务] 开始 · 标签页${tabId} · url=${url} · bvid=${bvid ?? '解析失败'}`);
+  logRun(`[任务] 开始 · 标签页${tabId} · url=${url} · bvid=${bvid ?? '解析失败'}`, 'INFO', 'TASK');
+  const T0 = Date.now();
+  const el = () => ((Date.now() - T0) / 1000).toFixed(1) + 's';
   if (!bvid) { report(tabId, '失败', '链接里没找到 BV 号'); stopKeepalive(); return; }
 
   try {
     report(tabId, '读取视频信息');
     const info = await getVideoContext(bvid);
     report(tabId, '读取视频信息', info.title);
+    logRun(`[视频] 标题=${info.title} · UP=${info.up} · 时长=${info.durationSec}s · cid=${info.cid} · 分P=${info.pages.length} · 封面=${info.pic ? '有' : '无'}`, 'INFO', 'VIDEO');
 
     report(tabId, '下载视频', '360P + 64K');
     const dash = await getPlayurlDash(bvid, info.cid);
+    if (!dash) throw new Error('playurl 返回空 dash（可能需要登录）');
+    logRun(`[下载] dash 流数：视频 ${(dash.video || []).length} 条（id=${(dash.video || []).map(v => v.id).join(',')}）音频 ${(dash.audio || []).length} 条（id=${(dash.audio || []).map(a => a.id).join(',')}）`, 'INFO', 'DASH');
     const { video, audio } = pickStreams(dash, 16);
     if (!audio) throw new Error('没有可用的音频流');
-    logRun(`[下载] 选流：视频=${(video.baseUrl || video.base_url || '').slice(0, 80)} 音频=${(audio.baseUrl || audio.base_url || '').slice(0, 80)}`);
+    logRun(`[下载] 选流：视频 id=${video.id} codecs=${video.codecs} 带宽=${video.bandwidth}｜音频 id=${audio.id} 带宽=${audio.bandwidth}`, 'INFO', 'DASH');
+    logRun(`[下载] 视频URL=${(video.baseUrl || video.base_url || '').slice(0, 100)}`, 'DEBUG', 'DASH');
+    logRun(`[下载] 音频URL=${(audio.baseUrl || audio.base_url || '').slice(0, 100)}`, 'DEBUG', 'DASH');
     let vBuf = await downloadStream(video.baseUrl || video.base_url,
       (g, t) => report(tabId, '下载视频', `视频 ${Math.round(g / t * 100)}%`));
     let aBuf = await downloadStream(audio.baseUrl || audio.base_url,
       (g, t) => report(tabId, '下载视频', `音频 ${Math.round(g / t * 100)}%`));
+    logRun(`[下载] 完成：视频 ${(vBuf.byteLength / 1024 / 1024).toFixed(2)}MB + 音频 ${(aBuf.byteLength / 1024 / 1024).toFixed(2)}MB · 累计 ${el()}`, 'INFO', 'DL');
 
     report(tabId, '本地合流', '初始化 ffmpeg 引擎…');
     const mergeTaskId = `t${tabId}-${Date.now()}`;
-    logRun(`[合流] 任务 ${mergeTaskId}：视频 ${vBuf.byteLength}B + 音频 ${aBuf.byteLength}B`);
+    logRun(`[合流] 任务 ${mergeTaskId}：视频 ${vBuf.byteLength}B + 音频 ${aBuf.byteLength}B`, 'INFO', 'FF');
+    const mT0 = Date.now();
     let merged = await offscreenMerge(mergeTaskId, vBuf, aBuf,
       (p) => report(tabId, '本地合流', `合流 ${Math.round(p * 100)}%`));
-    logRun(`[合流] 产物 ${merged.byteLength}B`);
+    logRun(`[合流] 产物 ${(merged.byteLength / 1024 / 1024).toFixed(2)}MB · 耗时 ${((Date.now() - mT0) / 1000).toFixed(1)}s`, 'INFO', 'FF');
     vBuf = aBuf = null;
 
     report(tabId, '上传到千问', '准备千问页面…');
@@ -467,7 +534,8 @@ async function runTask(url, tabId) {
     const st0 = await chrome.storage.local.get({ model: DEFAULT_MODEL, prompt_preamble: DEFAULT_PREAMBLE });
     const useModel = st0.model || DEFAULT_MODEL;
     const prompt = buildPrompt(await schema(), st0.prompt_preamble || DEFAULT_PREAMBLE);
-    logRun(`[配置] 模型=${useModel} · 提示词长度=${prompt.length} 字符（前置 ${st0.prompt_preamble.length} + 结构）`);
+    logRun(`[配置] 模型=${useModel} · 提示词长度=${prompt.length} 字符（前置 ${st0.prompt_preamble.length} + 结构）`, 'INFO', 'CFG');
+    logRun(`[配置] 提示词全文：${prompt.replace(/\s+/g, ' ')}`, 'DEBUG', 'CFG');
 
     // 任务元信息落盘：后台中途被浏览器重启时，可凭它 + chatId 恢复生成阶段
     const meta = {
@@ -485,27 +553,32 @@ async function runTask(url, tabId) {
       // 否则页面 JS 会被后台节流（上传管线冻结）。用户视图完全不动。
       let cdp = null;
       try {
-        cdp = await cdpEnsureActive(qtab, 4, (m) => logRun(`[CDP] ${m}`));
-        logRun(`[CDP] 附加成功（第 ${cdp.attempts} 次）· 页面状态=${JSON.stringify(cdp.state)}`);
+        cdp = await cdpEnsureActive(qtab, 4, (m) => logRun(`[CDP] ${m}`, 'DEBUG', 'CDP'));
+        logRun(`[CDP] 附加成功（第 ${cdp.attempts} 次）· 页面状态=${JSON.stringify(cdp.state)}`, 'INFO', 'CDP');
         report(tabId, '上传到千问', `页面已激活（第 ${cdp.attempts} 次附加成功）`);
       } catch (e) {
-        logRun(`[CDP] 激活失败：${e.message}`);
+        logEx('[CDP] 激活失败', e, 'CDP');
         report(tabId, '上传到千问', `未能激活页面（${e.message}），上传可能变慢`);
       }
 
       try {
+        const tTx = Date.now();
         await sendFileToTab(qtab, merged, name,
           (p) => report(tabId, '上传到千问', `传输给页面 ${p}%`));
+        logRun(`[传输] 送入页面完成 ${name} · 耗时 ${((Date.now() - tTx) / 1000).toFixed(1)}s`, 'INFO', 'TX');
         report(tabId, '发送给模型', '提交提问…');
         return await askTab(qtab, tabId, { fileName: name, model: useModel, prompt });
       } finally {
         cdp?.detach();                               // 发送完即解除，提示条消失
+        logRun('[CDP] 调试器已解除', 'DEBUG', 'CDP');
       }
     });
     merged = null;
     report(tabId, 'AI 生成', '模型正在观看视频…');
     await finishGeneration(meta, sent.chatId);       // 统一出口（后台重启后也可从这里恢复）
+    logRun(`[任务] 全流程结束 · 总耗时 ${el()}`, 'INFO', 'TASK');
   } catch (e) {
+    logEx(`[任务] 失败（累计 ${el()}）`, e, 'TASK');
     report(tabId, '失败', String(e?.message ?? e));
     chrome.runtime.sendMessage({ type: 'TASK_FAILED', tabId, error: String(e?.message ?? e) }).catch(() => {});
     await clearActiveTask();
@@ -635,9 +708,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg?.type === 'OFFSCREEN_LOG') {               // offscreen 的合流日志
-    logRun(`[合流引擎] ${msg.msg}`);
+    logRun(`[合流引擎] ${msg.msg}`, 'DEBUG', 'FF');
     return false;
   }
+  // 注意：日志落盘（选目录 / 授权 / 写文件）全部在 sidepanel 里做——
+  // Service Worker 没有 window，拿不到 File System Access API，也没有用户手势可用来 requestPermission。
+  // 这里只负责把日志行压进队列（见 logRun → dlog.enqueue）。
   if (msg?.type === 'GET_LOG') {
     (async () => {
       const log = await loadRunLog();
@@ -648,7 +724,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type === 'CLEAR_LOG') {
     runLog = [];
     chrome.storage.session.remove('runlog').catch(() => {});
-    logRun('── 日志已清空 ──');
+    dlog.clearQueue().catch(() => {});
+    logRun('── 日志已清空 ──', 'INFO', 'LOG');
     sendResponse({ ok: true });
     return false;
   }

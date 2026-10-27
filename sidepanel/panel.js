@@ -1,4 +1,6 @@
 // panel.js —— 侧边栏逻辑：输入/步骤/结果/历史
+import * as dlog from '../lib/dlog.js';
+
 const $ = (s) => document.querySelector(s);
 const STEPS = ['读取视频信息', '下载视频', '本地合流', '上传到千问', '发送给模型', 'AI 生成'];
 
@@ -248,6 +250,8 @@ async function applyTabState() {
   renderState(st);
   if (st) setScroll(st.scroll);
   refreshGo(url);
+  // 这个标签页的任务还在跑 → 保证日志定时落盘不被切换标签页打断
+  if (st?.busy) startLogFlushLoop();
 }
 
 function refreshGo(url) {
@@ -259,6 +263,11 @@ function refreshGo(url) {
 }
 
 chrome.runtime.onMessage.addListener((msg) => {
+  // background 在关键节点（完成/失败）主动请我们把日志写进文件
+  if (msg?.type === 'LOG_FLUSH_NOW') {
+    flushLogFile(false).catch(() => {});
+    return;
+  }
   if (msg?.type === 'PROGRESS') {
     if (msg.tabId !== myTab) return;                 // 别的标签页的任务，无视
     const { step, detail } = msg;
@@ -268,11 +277,14 @@ chrome.runtime.onMessage.addListener((msg) => {
       showErr(detail);
       setBar(0, false);
       busy = false;
+      stopLogFlushLoop();
+      flushLogFile(false).catch(() => {});           // 失败现场立刻落盘
     } else {
       $('#badge').textContent = '处理中';
       $('#badge').className = 'badge busy';
       setStep(step, 'running', detail);
       if (step === '读取视频信息' && detail) $('#step-title').textContent = detail;
+      startLogFlushLoop();
     }
     scheduleCache();                                 // 进度期间也持续存视图（防侧边栏重开丢进度）
   }
@@ -280,6 +292,8 @@ chrome.runtime.onMessage.addListener((msg) => {
     loadHistory();
     if (msg.tabId !== myTab) return;
     busy = false;
+    stopLogFlushLoop();
+    flushLogFile(false).catch(() => {});             // 完成时把剩余日志倒干净
     if (msg.ok && msg.data) {
       $('#badge').textContent = '完成';
       $('#badge').className = 'badge';
@@ -297,6 +311,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   if (msg?.type === 'TASK_FAILED') {
     if (msg.tabId !== myTab) return;
     busy = false;
+    stopLogFlushLoop();
+    flushLogFile(false).catch(() => {});
     $('#badge').textContent = '失败';
     $('#badge').className = 'badge err';
     showErr(msg.error);
@@ -314,6 +330,19 @@ $('#go').addEventListener('click', async () => {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   const url = tab?.url || '';
   if (!BILI_VIDEO.test(url)) { $('#go-hint').textContent = '当前页面不是 B站 视频页'; return; }
+
+  // 日志落盘：任务开始时静默检查。已授权就直接开始；没配置或权限失效才弹窗。
+  // 这里在点击处理器里，有用户手势，requestPermission()/showDirectoryPicker() 才能生效。
+  // 用户取消授权也不阻断任务，只是本次不落盘（并且本会话不再重复弹窗）。
+  const st = await refreshLogFileStatus().catch(() => null);
+  if (!st || !st.configured || st.permission !== 'granted') {
+    const ready = await flushLogFile(true).catch(() => null);
+    await refreshLogFileStatus();
+    if (ready && !ready.ok && ready.reason === 'need-permission') {
+      logFileMsg('日志目录权限已失效，本次不落盘（可在日志面板重新授权）');
+    }
+  }
+
   busy = true;
   state = {}; currentStepDetail = {};
   currentData = null;
@@ -325,6 +354,7 @@ $('#go').addEventListener('click', async () => {
   $('#badge').textContent = '处理中';
   $('#badge').className = 'badge busy';
   refreshGo(url);
+  startLogFlushLoop();
   chrome.runtime.sendMessage({ type: 'SUMMARIZE_URL', url, tabId: tab.id });
 });
 $('#refresh').addEventListener('click', loadHistory);
@@ -423,7 +453,116 @@ $('#log-clear').addEventListener('click', async () => {
 $('#toggle-log').addEventListener('click', () => {
   const hidden = $('#log-body').classList.toggle('hidden');
   $('#toggle-log').textContent = hidden ? '展开' : '收起';
-  if (!hidden) loadLog();                              // 展开时自动拉最新日志
+  if (!hidden) { loadLog(); refreshLogFileStatus(); }       // 展开时自动拉最新日志
+});
+
+// ── 本地日志文件（debug.log 追加写入）──
+// 为什么写在这里而不是 background：MV3 的 Service Worker 没有 window，
+// 拿不到 File System Access API；而 showDirectoryPicker()/requestPermission()
+// 还额外要求用户手势，只有侧边栏的点击处理器里才满足。
+// 权限策略（用户指定）：任务开始时静默检查；没配置/权限失效才弹窗。
+let logFlushTimer = null;
+let logFlushBusy = false;
+
+function logFileMsg(text, ok = false) {
+  const el = $('#logfile-saved');
+  el.textContent = text;
+  el.classList.toggle('hidden', !text);
+  el.style.color = ok ? '' : '#a33';
+  el.classList.toggle('ok', ok);
+  clearTimeout(logFileMsg._t);
+  if (text) logFileMsg._t = setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
+function renderLogFileStatus(st) {
+  const el = $('#logfile-status');
+  if (!st) { el.textContent = '状态未知：读取失败'; return; }
+  if (!st.configured) {
+    const q = st.pending?.batches ? `（队列已积压 ${st.pending.batches} 批待写）` : '';
+    el.textContent = `未配置${q}。点「选择目录」并选中 bili-ext 文件夹，日志会追加到 debug.log。`;
+    return;
+  }
+  const permText = st.permission === 'granted' ? '✅ 已授权'
+    : st.permission === 'denied' ? '❌ 已拒绝'
+    : '⚠️ 需重新授权（下次开始时弹窗）';
+  const sizeText = typeof st.fileSize === 'number'
+    ? ` ／ ${(st.fileSize / 1024).toFixed(1)}KB`
+    : '';
+  const q = st.pending?.batches ? ` ／ 队列积压 ${st.pending.batches} 批` : '';
+  el.textContent = `目录：${st.name} ／ ${st.file}${sizeText} ／ ${permText}${q}`;
+}
+
+async function refreshLogFileStatus() {
+  const st = await dlog.status().catch(() => null);
+  renderLogFileStatus(st);
+  return st;
+}
+
+// 把队列刷进 debug.log。interactive=true 才允许弹授权窗。
+async function flushLogFile(interactive = false) {
+  if (logFlushBusy) return null;
+  logFlushBusy = true;
+  try {
+    const r = await dlog.flush({ interactive });
+    if (r?.ok) {
+      if (r.written) {
+        let msg = `已写入 ${r.written} 行（${(r.bytes / 1024).toFixed(1)}KB）→ ${r.name}\\debug.log`;
+        if (r.dropped) msg += `　⚠ 队列曾丢弃 ${r.dropped} 批旧日志`;
+        logFileMsg(msg, true);
+      }
+    } else if (r?.reason === 'need-permission') {
+      renderLogFileStatus({ configured: true, name: r.name, permission: 'prompt', file: dlog.LOG_FILE });
+    } else if (r?.reason === 'no-handle') {
+      renderLogFileStatus({ configured: false, file: dlog.LOG_FILE });
+    }
+    return r;
+  } catch (e) {
+    return { ok: false, reason: String(e?.message ?? e) };
+  } finally {
+    logFlushBusy = false;
+  }
+}
+
+// 有任务在跑时定时刷（3s），否则不刷，避免无意义的文件写入
+function startLogFlushLoop() {
+  if (logFlushTimer) return;
+  logFlushTimer = setInterval(() => { flushLogFile(false).catch(() => {}); }, 3000);
+}
+function stopLogFlushLoop() {
+  clearInterval(logFlushTimer);
+  logFlushTimer = null;
+}
+
+$('#logfile-pick').addEventListener('click', async () => {
+  const r = await dlog.pickDir().catch(() => null);
+  if (r?.ok) {
+    logFileMsg(`已选目录：${r.name}，日志会写到 ${r.name}\\debug.log`, true);
+    await refreshLogFileStatus();
+    await flushLogFile(false);                     // 把积压的日志立刻倒进去
+  } else if (r?.reason === 'canceled') {
+    logFileMsg('已取消选择');
+  } else if (r?.reason === 'unsupported') {
+    logFileMsg('当前浏览器不支持 File System Access API');
+  } else {
+    logFileMsg('选择失败：' + (r?.reason || '未知'));
+  }
+});
+
+$('#logfile-flush').addEventListener('click', async () => {
+  await dlog.resetAskDismissed();                   // 手动点 = 用户主动要写，解除"不再询问"
+  const r = await flushLogFile(true);               // 点击 → 允许弹授权窗
+  if (r && !r.ok) {
+    if (r.reason === 'no-handle' || r.reason === 'canceled') logFileMsg('未选择目录，日志暂存侧边栏');
+    else logFileMsg('写入失败：' + (r.reason || '未知'));
+  }
+  await refreshLogFileStatus();
+});
+
+$('#logfile-clear').addEventListener('click', async () => {
+  if (!confirm('清空 debug.log 的内容？（后续仍会继续追加）')) return;
+  const r = await dlog.clearFile().catch(() => null);
+  if (r?.ok) logFileMsg('debug.log 已清空', true);
+  else logFileMsg('清空失败：' + (r?.reason || '未知'));
 });
 
 // 打开时若有进行中的任务事件（侧边栏晚开），至少恢复历史
@@ -432,3 +571,6 @@ renderSteps();
 loadSettings();
 applyTabState();
 loadLog();
+refreshLogFileStatus();
+// 侧边栏打开时把积压日志倒一次（不弹窗，没授权就等着）
+flushLogFile(false).catch(() => {});
