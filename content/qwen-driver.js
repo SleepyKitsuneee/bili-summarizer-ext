@@ -113,8 +113,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     })();
     return true;                                     // 异步回执
   }
-  // ── 诊断：探测多个候选接口，找出哪个能读到会话 ──
-  if (msg?.type === 'QWEN_PROBE_APIS') {
+  // ── 从页面 DOM 读答案（主方案，绕开接口鉴权）──
+  if (msg?.type === 'QWEN_READ_DOM') {
+    try {
+      const r = readAnswerFromDom();
+      sendResponse({ ok: true, ...r, href: location.href });
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
+  // ── 诊断：探测多个候选接口，找出哪个能读到会话 ──  if (msg?.type === 'QWEN_PROBE_APIS') {
     (async () => {
       const id = msg.chatId;
       const candidates = [
@@ -212,6 +221,78 @@ function netEvidence(sinceMs = 0) {
     const net = cap.__net || [];
     return net.filter(x => Date.now() - x.t < sinceMs);
   } catch { return []; }
+}
+
+// ── 直接从页面读答案 ──
+// 背景：读会话接口 /api/v2/chats/{id} 对扩展请求返回 Unauthorized（后端另有鉴权），
+// 但页面自己能正常拿到并渲染回答。所以主方案改成直接读 DOM，绕开接口鉴权。
+// 多路选择器兜底：不同版本类名不同，全试一遍取最完整的那段文本。
+
+// 常见的 assistant 消息容器（按可靠性排序）
+const ASSISTANT_SELECTORS = [
+  '[class*="assistant"] [class*="message"]',
+  '[class*="message"] [class*="assistant"]',
+  '[data-role="assistant"]',
+  '[class*="chat-message"][class*="ai"]',
+  '[class*="msg"][class*="ai"]',
+  '[class*="markdown"]',
+  '[class*="response"] [class*="content"]',
+];
+
+function isUserNode(el) {
+  const t = (el.className || '') + ' ' + (el.getAttribute?.('data-role') || '');
+  if (/user|question|input-msg|human/i.test(t)) return true;
+  // 用户那条消息是 909 字的提示词，内容固定，可以据此排除
+  const txt = (el.innerText || '');
+  if (txt.includes('请完整观看或收听这段视频') || txt.includes('只输出一个 JSON 对象本体')) return true;
+  return false;
+}
+
+// 判断页面是否还在生成（出现"停止生成"之类的按钮）
+function isGenerating() {
+  const t = document.body?.innerText || '';
+  if (/停止生成|停止回答|生成中|思考中|正在思考/.test(t)) return true;
+  const stopBtn = $$('button').find(b => /停止/.test(b.innerText || b.getAttribute('aria-label') || ''));
+  return !!stopBtn;
+}
+
+// 页面是否显示错误
+function pageError() {
+  const t = document.body?.innerText || '';
+  const m = t.match(/(糟糕[！!][^\n]{0,120}|输入或附件无效[^\n]{0,80}|出现问题[^\n]{0,80}|请检查后重试[^\n]{0,60})/);
+  return m ? m[0].trim() : '';
+}
+
+// 从页面上提取最新的 assistant 回答（同步，一次调用拿全部信息）
+function readAnswerFromDom() {
+  const nodes = [];
+  const seen = new Set();
+  for (const sel of ASSISTANT_SELECTORS) {
+    let list;
+    try { list = $$(sel); } catch { continue; }
+    for (const n of list) {
+      if (!n || seen.has(n)) continue;
+      if (isUserNode(n)) continue;
+      const txt = (n.innerText || '').trim();
+      if (txt.length < 20) continue;      // 太短，多半是按钮/图标容器
+      seen.add(n);
+      nodes.push({ sel, node: n, text: txt });
+    }
+  }
+  const base = { count: nodes.length, generating: isGenerating(), error: pageError() };
+  if (!nodes.length) return { ok: false, reason: 'no-node', ...base };
+  let best = nodes[0];
+  for (const n of nodes) if (n.text.length > best.text.length) best = n;
+  const last = nodes[nodes.length - 1];
+  // 流式输出时最后一个节点才是最新的；否则取最完整的那段
+  const pick = (last.text.length >= best.text.length * 0.6) ? last : best;
+  return {
+    ok: true,
+    text: pick.text,
+    via: pick.sel,
+    lengths: nodes.map(n => n.text.length),
+    ...base,
+  };
 }
 
 // ── 附件上传：双路径注入（菜单+input / dropzone 拖拽），卡片或网络证据任一出现即成功 ──

@@ -448,27 +448,41 @@ async function finishGeneration(meta, chatId) {
   const gT0 = Date.now();
   try {
     report(meta.taskTabId, 'AI 生成', '正在等待生成结果…');
-    // 开跑前先探一次：chatId 无效 / 接口结构变了，在这里就能立刻暴露，
-    // 不用等 25 分钟超时（历史故障：175 次轮询全是「没有 assistant 消息」）。
-    const probe = await probeChat(chatId);
-    if (probe.ok) {
-      logRun(`[探针] chatId=${chatId} 有效 · 消息字段=${probe.messageKey || '未找到'}`
-        + ` · 共 ${probe.total} 条 · assistant ${probe.assistants} 条`
-        + (probe.assistants ? '' : '（尚未开始生成，正常）'), 'INFO', 'GEN');
-    } else if (probe.bizError) {
-      logRun(`[探针] chatId=${chatId} 接口报业务错误：${probe.error}`, 'ERROR', 'GEN');
-      // 读会话失败时把所有候选接口都试一遍，一次日志就能定位到底是哪个环节
-      await probeApis(chatId);
-    } else {
-      logRun(`[探针] chatId=${chatId} 校验未通过：${probe.error}`, 'WARN', 'GEN');
-      await probeApis(chatId);
+    // 主方案：从千问页面 DOM 直接读（绕开接口鉴权）
+    let text = '', model = '页面读取';
+    const qtab = meta.qwenTabId ?? qwenTabId;
+    if (qtab != null) {
+      try {
+        const r = await pollAnswerFromDom(qtab, {
+          onTick: (len) => {
+            report(meta.taskTabId, 'AI 生成', `已生成 ${len} 字`);
+            logRun(`[生成] 页面已输出 ${len} 字 · 已等待 ${((Date.now() - gT0) / 1000).toFixed(0)}s`, 'DEBUG', 'GEN');
+          },
+        });
+        text = r.text; model = r.model;
+      } catch (e) {
+        logEx('[DOM] 读取失败，回退到接口轮询', e, 'GEN');
+      }
     }
-    const { text, model } = await pollAnswer(chatId, {
-      onTick: (len, m) => {
-        report(meta.taskTabId, 'AI 生成', `已生成 ${len} 字（${m}）`);
-        logRun(`[生成] 已取到 ${len} 字 · 模型=${m} · 已等待 ${((Date.now() - gT0) / 1000).toFixed(0)}s`, 'DEBUG', 'GEN');
-      },
-    });
+    if (!text) {
+      // 兜底：接口轮询（万一页面结构变了）
+      logRun('[生成] 回退到接口轮询', 'WARN', 'GEN');
+      const probe = await probeChat(chatId);
+      if (probe.ok) {
+        logRun(`[探针] chatId=${chatId} 有效 · 消息字段=${probe.messageKey || '未找到'}`
+          + ` · 共 ${probe.total} 条 · assistant ${probe.assistants} 条`, 'INFO', 'GEN');
+      } else {
+        logRun(`[探针] chatId=${chatId} 校验未通过：${probe.error}`, 'WARN', 'GEN');
+        await probeApis(chatId);
+      }
+      const r = await pollAnswer(chatId, {
+        onTick: (len, m) => {
+          report(meta.taskTabId, 'AI 生成', `已生成 ${len} 字（${m}）`);
+          logRun(`[生成] 已取到 ${len} 字 · 模型=${m} · 已等待 ${((Date.now() - gT0) / 1000).toFixed(0)}s`, 'DEBUG', 'GEN');
+        },
+      });
+      text = r.text; model = r.model;
+    }
     logRun(`[生成] 回答完成：${text.length} 字 · 模型=${model} · 耗时 ${((Date.now() - gT0) / 1000).toFixed(1)}s`, 'INFO', 'GEN');
     logRun(`[生成] 回答原文：${text.replace(/\s+/g, ' ')}`, 'DEBUG', 'RAW');
     let data = null, err = null;
