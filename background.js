@@ -2,7 +2,7 @@
 // 协议变更：offscreen 通信全部走 chrome.runtime 消息（实测 client.postMessage 通道不通）。
 // 多标签页并行：每个标签页独立任务状态；千问页面阶段全局排队，其余阶段并行。
 import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid, setLog as setBiliLog } from './lib/bilibili.js';
-import { pollAnswer, probeChat, setLog as setQwenLog } from './lib/qwen.js';
+import { pollAnswer, probeChat, setLog as setQwenLog, setPageFetch } from './lib/qwen.js';
 import { u8ToB64, b64ToU8 } from './lib/b64.js';
 import { cdpEnsureActive } from './lib/cdp.js';
 import { parseSummaryJson } from './lib/json.js';
@@ -66,6 +66,31 @@ const logErr = (msg, tag) => logRun(msg, 'ERROR', tag);
 // 把 logRun 注入 lib 层（避免 lib 反向 import background 造成循环依赖）
 setBiliLog((m) => logRun(m, 'DEBUG', 'NET'));
 setQwenLog((m) => logRun(m, 'DEBUG', 'QWEN'));
+// 把「页面代理」注入 qwen.js：读会话必须从 chat.qwen.ai 页面内部发请求。
+// 原因：SW 的 fetch 算第三方请求，千问登录 cookie 是 SameSite=Lax，不会发出，
+// 接口直接返回 {"success":false,"data":{"code":"Unauthorized"}}。
+setPageFetch(async (url, init = {}) => {
+  // 优先用当前记录的千问标签页；后台重启后 qwenTabId 可能为 null，兜底查一次
+  let tabId = qwenTabId;
+  if (tabId == null) {
+    const tabs = await chrome.tabs.query({ url: ['https://chat.qwen.ai/*'] }).catch(() => []);
+    tabId = tabs[0]?.id ?? null;
+    if (tabId != null) {
+      qwenTabId = tabId;
+      logRun(`[代理] qwenTabId 丢失，兜底找回标签页 ${tabId}`, 'WARN', 'GEN');
+    }
+  }
+  if (tabId == null) throw new Error('千问标签页未就绪，无法代理请求');
+  const r = await chrome.tabs.sendMessage(tabId, {
+    type: 'QWEN_API_FETCH',
+    url,
+    method: init.method || 'GET',
+    headers: init.headers || {},
+    body: init.body,
+  }).catch((e) => { throw new Error('页面代理失败：' + e.message); });
+  if (!r?.ok) throw new Error('页面代理失败：' + (r?.error || '未知'));
+  return { ok: r.status >= 200 && r.status < 300, status: r.status, json: r.json, text: r.text };
+});
 // 异常专用：连 stack 一起记，只看 message 往往定位不到行号
 function logEx(prefix, e, tag = 'EXC') {
   const msg = e?.message ?? e;

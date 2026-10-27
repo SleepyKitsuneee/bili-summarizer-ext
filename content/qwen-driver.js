@@ -81,6 +81,29 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
     return;
   }
+  // ── 页面内代理请求（同源 fetch，自带登录 cookie）──
+  // 背景：Service Worker 的 fetch 算第三方请求，千问的登录 cookie 是 SameSite=Lax，
+  // 不会随 credentials:'include' 发出 → 读会话接口返回 Unauthorized。
+  // 由页面自己发请求就没有这个问题。
+  if (msg?.type === 'QWEN_API_FETCH') {
+    (async () => {
+      try {
+        const r = await fetch(msg.url, {
+          method: msg.method || 'GET',
+          credentials: 'include',
+          headers: msg.headers || {},
+          body: msg.body,
+        });
+        const text = await r.text();
+        let json = null;
+        try { json = JSON.parse(text); } catch {}
+        sendResponse({ ok: true, status: r.status, json, text: text.slice(0, 2000) });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message ?? e) });
+      }
+    })();
+    return true;                                     // 异步回执
+  }
   if (msg?.type === 'QWEN_LIST_MODELS') {           // 只读模型名字给侧边栏做下拉候选
     (async () => {
       try {

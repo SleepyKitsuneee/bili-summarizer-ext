@@ -124,6 +124,19 @@ background.js（任务编排，每个标签页独立）
 
 ## 更新日志
 
+### v0.7.4（2026-10-27）
+
+**修复**
+
+- 修复读会话返回 `Unauthorized`（致命）：SW 的 fetch 算第三方请求，千问登录 cookie 是 `SameSite=Lax` 不会发出；改为由 chat.qwen.ai 页面内部发同源请求（`QWEN_API_FETCH` 代理）。
+- 修复代理分支里 `r.status` 未定义导致 `Cannot read properties of undefined`。
+- 修复代理通道故障时错误被吞成通用错误：现在原样抛出，日志能看到真实原因。
+
+**改进**
+
+- 后台重启后 `qwenTabId` 丢失时自动兜底查找千问标签页。
+- 新增 `test-page-proxy.mjs`（5 例）：无代理识别 Unauthorized、有代理走页面、pollAnswer 经代理取答案、代理失败信息清晰、日志标明通道。
+
 ### v0.7.3（2026-10-27）
 
 **修复**
