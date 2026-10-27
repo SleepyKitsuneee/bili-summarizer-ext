@@ -128,77 +128,31 @@ background.js（任务编排，每个标签页独立）
 
 **修复**
 
-- **修复「AI 生成」阶段永久卡死**（严重）
-
-  现象：千问页面已经把 JSON 完整输出，侧边栏却一直停在「AI 生成 · 正在等待生成结果…」，直到 25 分钟超时。
-
-  根因：`extractAnswer()` 只认 `content_list` 里 `phase === 'answer'` 的段。当模型把正文写进其他 phase（或 `phase` 值不是字符串）时，取到的正文恒为空，`done && text` 条件永不成立。
-
-  修复：改为三层退化（answer 段 → 非 think 段 → 全部段），并补一层「连续 2 次 done 仍无正文就退化取全部文本」的兜底。`phase` 比较改用 `String()`，兼容 null / 数字。
-
-- **修复运行日志丢失**（严重）
-
-  现象：跑完整个任务，`debug.log` 里只有 `BOOT` / `ENV` 几行，任务日志一行都没有。
-
-  根因：日志入队用了 `setTimeout` 做防抖批量落盘。MV3 的 Service Worker 在长任务里 `await` 网络请求时会交出事件循环，`setTimeout` 回调可能被无限推迟甚至随 SW 回收一起消失。
-
-  修复：改为 Promise 链串行刷盘，不依赖任何定时器；`ERROR` 级日志立即刷盘；队列积压有计数不再静默丢弃。
-
-- **修复 JSON 解析过于脆弱**
-
-  原实现用 `slice(indexOf('{'), lastIndexOf('}'))`，遇到说明文字里带花括号、字符串值内含花括号、回答里有多段 JSON 时会拼出非法 JSON。
-
-  新增 `lib/json.js`：逐个起点做括号配平扫描（跳过字符串内部与转义），优先返回含总结特征字段的对象。
+- 修复「AI 生成」阶段永久卡死：`extractAnswer` 只认 `phase === 'answer'`，模型把正文写进其他 phase 时正文恒为空，一直轮询到 25 分钟超时；改为三层退化 + 连续 done 兜底。
+- 修复运行日志丢失：日志入队用 `setTimeout` 防抖，MV3 的 SW 在长任务中会丢掉定时器回调；改为 Promise 链串行刷盘，ERROR 级立即落盘。
+- 修复 JSON 解析过于脆弱：原来用 `slice(indexOf('{'), lastIndexOf('}'))`，遇到花括号干扰或多段 JSON 会解析失败；改用括号配平扫描。
 
 **新增**
 
-- **本地调试日志落盘**（`debug.log`）
-
-  侧边栏日志区新增「本地日志文件」：选择目录后日志持续追加写入。支持查看已写体积、队列积压、立即写入、清空文件。
-
-  权限策略：任务开始时静默检查，未配置或权限失效才弹窗。
-
-- **日志采集点大幅扩充**
-
-  新增 `TASK` / `VIDEO` / `DASH` / `DL` / `NET` / `FF` / `CDP` / `TX` / `GEN` / `RAW` / `STEP` / `EXC` 等标签，覆盖网络状态码、content-length、下载速率、ffmpeg 完整 stderr、CDP 每次附加尝试、分块传输重试、轮询失败计数、异常堆栈。
-
-- **`DEBUG_LOG.md`** 说明文档。
+- 本地调试日志落盘 `debug.log`：侧边栏选择目录后持续追加写入，任务开始时静默检查权限，失效才弹窗。
+- 日志采集点扩充至 `TASK`/`VIDEO`/`DASH`/`DL`/`NET`/`FF`/`CDP`/`TX`/`GEN`/`RAW`/`STEP`/`EXC`，覆盖网络状态码、ffmpeg 完整 stderr、CDP 附加尝试、轮询失败计数、异常堆栈。
+- 新增 `DEBUG_LOG.md` 说明文档。
+- 新增 4 个 Node 单元测试，覆盖日志队列、`extractAnswer`、`pollAnswer` 兜底、JSON 提取。
 
 **改进**
 
-- 日志单行上限 500 → 4000 字（ffmpeg stderr / 模型原文不再被截断），内存上限 1200 → 1500 行。
-- 分块传输日志由「每块一行」改为「每 10 块一行」，避免刷屏。
+- 日志单行上限 500 → 4000 字，内存上限 1200 → 1500 行。
+- 分块传输日志改为每 10 块一行，避免刷屏。
 - ffmpeg 失败时逐行上报完整 stderr（原来只留最后 25 行）。
 - 任务进行中切换标签页不再中断日志定时落盘。
 
-**测试**
-
-新增 4 个 Node 单元测试（无需浏览器）：
-
-| 文件 | 覆盖 |
-|---|---|
-| `test/test-dlog-queue.mjs` | 5000 行入队 + 中途刷盘 + 并发入队，验证不丢行、顺序正确 |
-| `test/test-extract-answer.mjs` | `extractAnswer` 三层退化、`phase` 非字符串、多段拼接等 10 例 |
-| `test/test-poll-answer.mjs` | 复现「done 但无 answer 段」故障，验证兜底返回 |
-| `test/test-parse-json.mjs` | JSON 提取健壮性 13 例（代码块、花括号干扰、转义、多段、截断） |
-
-运行：
-
-```bash
-cd bili-ext
-node test/test-dlog-queue.mjs
-node test/test-extract-answer.mjs
-node test/test-poll-answer.mjs
-node test/test-parse-json.mjs
-```
-
 ### v0.6.1
 
-- 多标签页并行任务，每个标签页独立状态与视图缓存
-- 千问阶段全局排队，避免两个任务争抢同一个千问标签页
-- CDP 激活千问页（`Emulation.setFocusEmulationEnabled` + `Page.setWebLifecycleState`），解决后台标签页节流导致上传冻结
-- 后台被浏览器重启后可凭 `activeTask` + `chatId` 恢复生成阶段
-- 侧边栏日志面板（查看 / 复制 / 清空）
+- 多标签页并行任务，每个标签页独立状态与视图缓存。
+- 千问阶段全局排队，避免两个任务争抢同一个千问标签页。
+- CDP 激活千问页，解决后台标签页节流导致上传冻结。
+- 后台被浏览器重启后可凭 `activeTask` + `chatId` 恢复生成阶段。
+- 侧边栏日志面板（查看 / 复制 / 清空）。
 
 ---
 
