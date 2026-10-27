@@ -308,7 +308,12 @@ async function waitParsed(maxMs = 5 * 60_000) {
 }
 
 // ── 发送提问 ──
+// 注意：这里「没进入会话页」不再等于失败。
+// 实测页面可能停在 /c/new-chat 但消息已经发出、AI 也在正常回答
+//（真实会话 ID 只在创建会话的响应体里）。所以 sendPrompt 只负责把内容发出去，
+// chatId 由 resolveChatId() 从 URL 或网络响应里取。
 async function sendPrompt(prompt) {
+  let sent = false;
   for (let attempt = 1; attempt <= 2; attempt++) {
     const ta = $('textarea');
     if (!ta) throw new Error('找不到输入框');
@@ -322,6 +327,8 @@ async function sendPrompt(prompt) {
     setter.call(ta, prompt);
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     await sleep(900);
+    // 记录输入框实际内容长度（诊断：确认文字真的进到了输入框）
+    qlog(`输入框内容长度=${String(ta.value || '').length} 字`);
     ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true }));
     ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
     await sleep(5000);
@@ -333,18 +340,26 @@ async function sendPrompt(prompt) {
     const sendBtn = $('button[aria-label*="发送"], button[aria-label*="Send"], .send-button, #send-message-button')
       || $$('button').find(b => /发送|Send/.test(b.getAttribute('aria-label') || b.innerText || ''));
     if (sendBtn) { qlog('回车无效，改点发送按钮'); sendBtn.click(); await sleep(4000); }
-    else qlog('回车无效且没找到发送按钮');
+    else {
+      // 诊断：把页面上所有按钮的标识列出来，便于下次补选择器
+      const btns = $$('button').map(b => (b.getAttribute('aria-label') || b.getAttribute('title') || b.innerText || '').trim().slice(0, 12)).filter(Boolean);
+      qlog(`回车无效且没找到发送按钮 · 页面上的按钮=[${btns.slice(0, 30).join('|')}]`, 'ERROR');
+    }
     if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) {
       qlog(`按钮发送成功，已进入会话页 · URL=${location.href}`);
       return;
     }
     // 没进会话页时把现场记全：URL、页面是否有报错提示、附件卡片还在不在
     const bodyText = (document.body?.innerText || '').slice(0, 300).replace(/\s+/g, ' ');
-    qlog(`第 ${attempt} 次发送未进入会话页 · path=${location.pathname}`
+    const inputText = String(ta.value || '').length;
+    qlog(`第 ${attempt} 次未进入会话页 · path=${location.pathname}`
+      + ` · 输入框残留 ${inputText} 字`
       + ` · 附件卡片=${!!findAttachCard()}`
       + ` · 页面首屏文字=${bodyText}`);
+    // 输入框被清空 = 消息大概率已发出（页面取走了内容）
+    if (inputText === 0) { sent = true; qlog('输入框已清空，判断消息已发出'); break; }
   }
-  throw new Error('发送失败：未进入会话页');
+  if (!sent) qlog('两次尝试后仍未确认发送成功，将继续尝试解析 chatId', 'WARN');
 }
 
 // ── A/B 对比面板跳过 ──
@@ -356,6 +371,63 @@ setInterval(() => {
     }
   } catch {}
 }, 3000);
+
+// ── 解析真实 chatId ──
+// 关键教训：页面 URL 可能停在 /c/new-chat（前端占位符），真实会话 ID 只在
+// 「创建会话」接口的响应体里。所以按优先级依次尝试：
+//   1) URL 里的 UUID（最可靠，页面确实跳过去了）
+//   2) MAIN world 补丁从网络响应里抓到的 chatId（URL 没跳时靠它）
+//   3) 轮询等待（会话创建有延迟，等最多 waitMs）
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+function captureData() {
+  try { return JSON.parse(document.documentElement.dataset.qwenCapture || '{}'); } catch { return {}; }
+}
+function urlChatId() {
+  const m = location.pathname.match(/\/c\/([0-9a-f-]{20,})/i);
+  return m && UUID_RE.test(m[1]) ? m[1] : null;
+}
+function capturedChatId() {
+  const cap = captureData();
+  const list = cap.__chatIds || [];
+  return (list.length ? list[list.length - 1].id : null) || cap.__lastChatId || null;
+}
+
+async function resolveChatId(waitMs = 45_000) {
+  const t0 = Date.now();
+  let lastLog = 0;
+  for (;;) {
+    const fromUrl = urlChatId();
+    if (fromUrl) {
+      qlog(`chatId 来源=URL · ${fromUrl} · URL=${location.href}`);
+      return fromUrl;
+    }
+    const fromNet = capturedChatId();
+    if (fromNet) {
+      const cap = captureData();
+      const hit = (cap.__chatIds || []).find(x => x.id === fromNet);
+      qlog(`chatId 来源=网络响应 · ${fromNet}`
+        + ` · 来自 ${hit ? hit.src + ' ' + hit.u : '未知'}`
+        + ` · 当前 URL=${location.href}（URL 里没有 UUID）`);
+      return fromNet;
+    }
+    if (Date.now() - t0 > waitMs) {
+      const cap = captureData();
+      qlog(`等待 chatId 超时（${(waitMs / 1000).toFixed(0)}s）`
+        + ` · URL=${location.href}`
+        + ` · 捕获到的 chatIds=${JSON.stringify(cap.__chatIds || [])}`
+        + ` · 捕获字段=[${Object.keys(cap).join(',')}]`, 'ERROR');
+      return null;
+    }
+    if (Date.now() - lastLog > 5000) {
+      lastLog = Date.now();
+      const cap = captureData();
+      qlog(`等待 chatId…（已等 ${((Date.now() - t0) / 1000).toFixed(0)}s）`
+        + ` · URL=${location.href} · 已捕获 ${(cap.__chatIds || []).length} 个`);
+    }
+    await sleep(500);
+  }
+}
 
 // ── 主流程 ──
 chrome.runtime.onMessage.addListener((msg) => {
@@ -374,23 +446,20 @@ chrome.runtime.onMessage.addListener((msg) => {
       await waitParsed();
       report({ type: 'QWEN_STEP', step: 'AI 生成', detail: '发送提问…' });
       await sendPrompt(msg.prompt);
-      const m = location.pathname.match(/\/c\/([0-9a-f-]{20,})/);
-      if (!m) throw new Error('发送后未进入会话页');
-      const chatId = m[1];
-      // 关键诊断：确认这个 chatId 真的来自当前页面 URL，并检查页面有没有报错提示
+      // 不再只认 URL：页面可能停在 /c/new-chat，真实 chatId 要从网络响应里拿
+      const chatId = await resolveChatId(45_000);
+      if (!chatId) throw new Error('拿不到真实 chatId（URL 停在占位页，也没捕获到创建会话的响应）');
       const bodyText = (document.body?.innerText || '');
       const errHints = ['糟糕', '出现问题', '输入或附件无效', '请检查后重试', '访问验证', '请求过于频繁']
         .filter(k => bodyText.includes(k));
-      qlog(`已进入会话页 chatId=${chatId} · URL=${location.href}`);
       qlog(`页面状态：附件卡片=${!!findAttachCard()}`
         + ` · 页面文字长度=${bodyText.length}`
         + ` · 命中报错关键词=[${errHints.join(',') || '无'}]`);
       if (errHints.length) {
-        // 页面已经明确报错，这个会话很可能根本没建立，后台必然 Unauthorized
         const idx = Math.max(...errHints.map(k => bodyText.indexOf(k)));
         qlog(`⚠ 页面报错原文：${bodyText.slice(Math.max(0, idx - 40), idx + 160).replace(/\s+/g, ' ')}`, 'ERROR');
       }
-      qlog(`开始回报后台（带确认重试）`);
+      qlog(`开始回报后台 chatId=${chatId}（带确认重试）`);
       // QWEN_SENT 带确认重试：后台可能在长流程中重启过（内存握手会丢），
       // 而本流程活在页面里不受影响——重试直到后台确认，任务就能续上
       for (let i = 0; i < 100; i++) {
