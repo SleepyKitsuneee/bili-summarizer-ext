@@ -137,7 +137,7 @@ background.js（任务编排，每个标签页独立）
 - 本地调试日志落盘 `debug.log`：侧边栏选择目录后持续追加写入，任务开始时静默检查权限，失效才弹窗。
 - 日志采集点扩充至 `TASK`/`VIDEO`/`DASH`/`DL`/`NET`/`FF`/`CDP`/`TX`/`GEN`/`RAW`/`STEP`/`EXC`，覆盖网络状态码、ffmpeg 完整 stderr、CDP 附加尝试、轮询失败计数、异常堆栈。
 - 新增 `DEBUG_LOG.md` 说明文档。
-- 新增 4 个 Node 单元测试，覆盖日志队列、`extractAnswer`、`pollAnswer` 兜底、JSON 提取。
+- 新增 4 个 Node 单元测试（`test_script/tests/`），覆盖日志队列、`extractAnswer`、`pollAnswer` 兜底、JSON 提取。
 
 **改进**
 
