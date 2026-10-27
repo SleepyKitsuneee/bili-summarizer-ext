@@ -85,9 +85,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   // 背景：Service Worker 的 fetch 算第三方请求，千问的登录 cookie 是 SameSite=Lax，
   // 不会随 credentials:'include' 发出 → 读会话接口返回 Unauthorized。
   // 由页面自己发请求就没有这个问题。
+  // 同时回传页面现场（location / cookie / 登录态），方便在日志里一眼看出是哪种情况。
   if (msg?.type === 'QWEN_API_FETCH') {
     (async () => {
       try {
+        const page = {
+          href: location.href,
+          onChatPage: /\/c\/[0-9a-f-]{20,}/.test(location.pathname),
+          cookieLen: (document.cookie || '').length,
+          cookieNames: (document.cookie || '').split(';').map(s => s.split('=')[0].trim()).filter(Boolean),
+          hasLoginHint: !(document.body?.innerText || '').includes('注册'),
+          title: document.title,
+        };
         const r = await fetch(msg.url, {
           method: msg.method || 'GET',
           credentials: 'include',
@@ -97,12 +106,53 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         const text = await r.text();
         let json = null;
         try { json = JSON.parse(text); } catch {}
-        sendResponse({ ok: true, status: r.status, json, text: text.slice(0, 2000) });
+        sendResponse({ ok: true, status: r.status, json, text: text.slice(0, 2000), page });
       } catch (e) {
         sendResponse({ ok: false, error: String(e?.message ?? e) });
       }
     })();
     return true;                                     // 异步回执
+  }
+  // ── 诊断：探测多个候选接口，找出哪个能读到会话 ──
+  if (msg?.type === 'QWEN_PROBE_APIS') {
+    (async () => {
+      const id = msg.chatId;
+      const candidates = [
+        `/api/v2/chats/${id}`,
+        `/api/v2/chat/${id}`,
+        `/api/v1/chats/${id}`,
+        `/api/v2/chats/${id}/messages`,
+        `/api/v2/conversations/${id}`,
+        `/api/v2/chat/completions/${id}`,
+      ];
+      const out = [];
+      for (const path of candidates) {
+        const t0 = Date.now();
+        try {
+          const r = await fetch(path, {
+            credentials: 'include',
+            headers: { 'accept': 'application/json', 'source': 'web', 'version': '0.2.91' },
+          });
+          const text = await r.text();
+          let json = null;
+          try { json = JSON.parse(text); } catch {}
+          out.push({
+            path,
+            status: r.status,
+            ms: Date.now() - t0,
+            success: json?.success ?? null,
+            code: json?.data?.code ?? null,
+            keys: json ? Object.keys(json).join(',') : '',
+            dataKeys: json?.data ? Object.keys(json.data).join(',') : '',
+            head: text.slice(0, 160),
+          });
+        } catch (e) {
+          out.push({ path, error: String(e?.message ?? e) });
+        }
+      }
+      sendResponse({ ok: true, results: out, href: location.href });
+    })();
+    return true;
   }
   if (msg?.type === 'QWEN_LIST_MODELS') {           // 只读模型名字给侧边栏做下拉候选
     (async () => {
@@ -172,6 +222,14 @@ async function attachFile(fileId, fileName) {
   if (document.documentElement.dataset.qwenPatch !== '1') {
     throw new Error('页面补丁未就绪（MAIN world 注入失败）');
   }
+
+  // 诊断：把文件元信息记全，附件无效时能对照服务端限制
+  qlog(`待上传文件：name=${file.name} · size=${(file.size / 1024 / 1024).toFixed(2)}MB`
+    + ` · type=${file.type || '(空)'} · lastModified=${file.lastModified}`);
+  const inputs = $$('input[type=file]').map(i => ({
+    id: i.id, accept: i.accept, multiple: i.multiple,
+  }));
+  qlog(`页面文件输入框：${JSON.stringify(inputs)}`);
 
   const netBefore = netEvidence(10 * 60_000).length;
 
@@ -254,7 +312,10 @@ async function sendPrompt(prompt) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     const ta = $('textarea');
     if (!ta) throw new Error('找不到输入框');
-    qlog(`发送提问第 ${attempt}/2 次 · 提示词 ${prompt.length} 字`);
+    qlog(`发送提问第 ${attempt}/2 次 · 提示词 ${prompt.length} 字 · 发送前 URL=${location.href}`);
+    // 发送前记录页面上可见的会话链接（用于对比 chatId 来源）
+    const links = $$('a[href*="/c/"]').map(a => a.getAttribute('href')).filter(Boolean).slice(0, 5);
+    if (links.length) qlog(`发送前页面上的会话链接：[${links.join(', ')}]`);
     ta.focus();
     await sleep(300);
     const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set;
@@ -264,14 +325,24 @@ async function sendPrompt(prompt) {
     ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true, cancelable: true }));
     ta.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
     await sleep(5000);
-    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) { qlog('回车发送成功，已进入会话页'); return; }
+    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) {
+      qlog(`回车发送成功，已进入会话页 · URL=${location.href}`);
+      return;
+    }
     // 兜底：回车没触发就点发送按钮
     const sendBtn = $('button[aria-label*="发送"], button[aria-label*="Send"], .send-button, #send-message-button')
       || $$('button').find(b => /发送|Send/.test(b.getAttribute('aria-label') || b.innerText || ''));
     if (sendBtn) { qlog('回车无效，改点发送按钮'); sendBtn.click(); await sleep(4000); }
     else qlog('回车无效且没找到发送按钮');
-    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) { qlog('按钮发送成功，已进入会话页'); return; }
-    qlog(`第 ${attempt} 次发送未进入会话页，当前路径 ${location.pathname}`);
+    if (/\/c\/[0-9a-f-]{20,}/.test(location.pathname)) {
+      qlog(`按钮发送成功，已进入会话页 · URL=${location.href}`);
+      return;
+    }
+    // 没进会话页时把现场记全：URL、页面是否有报错提示、附件卡片还在不在
+    const bodyText = (document.body?.innerText || '').slice(0, 300).replace(/\s+/g, ' ');
+    qlog(`第 ${attempt} 次发送未进入会话页 · path=${location.pathname}`
+      + ` · 附件卡片=${!!findAttachCard()}`
+      + ` · 页面首屏文字=${bodyText}`);
   }
   throw new Error('发送失败：未进入会话页');
 }
@@ -305,12 +376,26 @@ chrome.runtime.onMessage.addListener((msg) => {
       await sendPrompt(msg.prompt);
       const m = location.pathname.match(/\/c\/([0-9a-f-]{20,})/);
       if (!m) throw new Error('发送后未进入会话页');
-      qlog(`已进入会话页 chatId=${m[1]}，开始回报后台（带确认重试）`);
+      const chatId = m[1];
+      // 关键诊断：确认这个 chatId 真的来自当前页面 URL，并检查页面有没有报错提示
+      const bodyText = (document.body?.innerText || '');
+      const errHints = ['糟糕', '出现问题', '输入或附件无效', '请检查后重试', '访问验证', '请求过于频繁']
+        .filter(k => bodyText.includes(k));
+      qlog(`已进入会话页 chatId=${chatId} · URL=${location.href}`);
+      qlog(`页面状态：附件卡片=${!!findAttachCard()}`
+        + ` · 页面文字长度=${bodyText.length}`
+        + ` · 命中报错关键词=[${errHints.join(',') || '无'}]`);
+      if (errHints.length) {
+        // 页面已经明确报错，这个会话很可能根本没建立，后台必然 Unauthorized
+        const idx = Math.max(...errHints.map(k => bodyText.indexOf(k)));
+        qlog(`⚠ 页面报错原文：${bodyText.slice(Math.max(0, idx - 40), idx + 160).replace(/\s+/g, ' ')}`, 'ERROR');
+      }
+      qlog(`开始回报后台（带确认重试）`);
       // QWEN_SENT 带确认重试：后台可能在长流程中重启过（内存握手会丢），
       // 而本流程活在页面里不受影响——重试直到后台确认，任务就能续上
       for (let i = 0; i < 100; i++) {
         try {
-          const r = await chrome.runtime.sendMessage({ type: 'QWEN_SENT', chatId: m[1] });
+          const r = await chrome.runtime.sendMessage({ type: 'QWEN_SENT', chatId });
           if (r?.ok) { qlog(`发送回执已确认（第 ${i + 1} 次）`); return; }
         } catch {}
         if (i % 10 === 0) qlog(`回执尚未确认，第 ${i + 1} 次重试中…（后台可能重启过）`);

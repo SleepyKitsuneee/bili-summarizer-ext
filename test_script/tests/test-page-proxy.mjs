@@ -111,7 +111,7 @@ let pass = 0, fail = 0;
   }
 }
 
-// 场景 5：诊断日志要标明走的是哪条通道
+// 场景 5：诊断日志要标明走的是哪条通道 + 实际发出的 URL 与 referer
 {
   setPageFetch(async () => ({
     ok: true, status: 200,
@@ -120,10 +120,15 @@ let pass = 0, fail = 0;
   logs.length = 0;
   await probeChat('id');
   const joined = logs.join('\n');
-  if (/经页面代理读取/.test(joined)) {
-    pass++; console.log('✅ 场景5：日志标明走页面代理');
+  const hasChannel = /通道=页面代理/.test(joined);
+  const hasUrl = /请求 URL=.*\/api\/v2\/chats\/id/.test(joined);
+  const hasReferer = /referer=.*\/c\/id/.test(joined);
+  if (hasChannel && hasUrl && hasReferer) {
+    pass++; console.log('✅ 场景5：日志标明通道 + URL + referer（referer 已指向会话页）');
   } else {
-    fail++; console.log(`❌ 场景5：日志没标明通道：${joined.slice(0, 200)}`);
+    fail++;
+    console.log(`❌ 场景5：日志缺信息（通道=${hasChannel} URL=${hasUrl} referer=${hasReferer}）`);
+    console.log('   日志：' + joined.slice(0, 300));
   }
 }
 

@@ -124,6 +124,21 @@ background.js（任务编排，每个标签页独立）
 
 ## 更新日志
 
+### v0.7.5（2026-10-27）
+
+**改进（全链路诊断）**
+
+- 读会话日志补齐所有可能影响结果的信息：通道（页面代理/SW 直连）、实际 URL、referer、完整响应体结构。
+- 新增页面现场日志：`location.href`、是否在会话页、`document.cookie` 长度与 cookie 名、登录态标记；页面 URL 不含 chatId 时告警。
+- 新增接口普查：读会话失败时自动把所有候选接口（`/api/v2/chats`、`/api/v1/chats`、`/api/v2/conversations` 等 6 个）逐个试一遍，日志里能看到哪个能通。
+- 新增附件元信息日志：文件名、大小、MIME、`lastModified`、页面上所有 `input[type=file]` 的 accept 属性。
+- 新增发送现场日志：发送前后 URL、页面上的会话链接、是否进入会话页、命中报错关键词（「输入或附件无效」等）及原文片段。
+
+**修复**
+
+- 修复 `referer` 用首页导致可能被判跨会话：现在拼成完整会话页 `https://chat.qwen.ai/c/{chatId}`（与桌面版 `page.url` 一致）。
+- 修复 ffmpeg 日志全是 `[object Object]`：logger 收到对象时改取 `message`/`text`/`line` 字段。
+
 ### v0.7.4（2026-10-27）
 
 **修复**

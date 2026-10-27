@@ -2,7 +2,7 @@
 // 协议变更：offscreen 通信全部走 chrome.runtime 消息（实测 client.postMessage 通道不通）。
 // 多标签页并行：每个标签页独立任务状态；千问页面阶段全局排队，其余阶段并行。
 import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid, setLog as setBiliLog } from './lib/bilibili.js';
-import { pollAnswer, probeChat, setLog as setQwenLog, setPageFetch } from './lib/qwen.js';
+import { pollAnswer, probeChat, setLog as setQwenLog, setPageFetch, setProbeApis } from './lib/qwen.js';
 import { u8ToB64, b64ToU8 } from './lib/b64.js';
 import { cdpEnsureActive } from './lib/cdp.js';
 import { parseSummaryJson } from './lib/json.js';
@@ -89,8 +89,31 @@ setPageFetch(async (url, init = {}) => {
     body: init.body,
   }).catch((e) => { throw new Error('页面代理失败：' + e.message); });
   if (!r?.ok) throw new Error('页面代理失败：' + (r?.error || '未知'));
-  return { ok: r.status >= 200 && r.status < 300, status: r.status, json: r.json, text: r.text };
+  return { ok: r.status >= 200 && r.status < 300, status: r.status, json: r.json, text: r.text, page: r.page };
 });
+
+// 接口普查：读会话失败时把所有候选接口都试一遍，日志里能看到哪个能通
+async function probeApis(chatId) {
+  let tabId = qwenTabId;
+  if (tabId == null) {
+    const tabs = await chrome.tabs.query({ url: ['https://chat.qwen.ai/*'] }).catch(() => []);
+    tabId = tabs[0]?.id ?? null;
+  }
+  if (tabId == null) { logRun('[普查] 没有千问标签页，跳过', 'WARN', 'QWEN'); return; }
+  try {
+    const r = await chrome.tabs.sendMessage(tabId, { type: 'QWEN_PROBE_APIS', chatId });
+    if (!r?.ok) { logRun(`[普查] 失败：${r?.error || '未知'}`, 'WARN', 'QWEN'); return; }
+    logRun(`[普查] 页面位置=${r.href}`, 'INFO', 'QWEN');
+    for (const x of r.results || []) {
+      if (x.error) logRun(`[普查] ${x.path} → 异常 ${x.error}`, 'WARN', 'QWEN');
+      else logRun(`[普查] ${x.path} → HTTP ${x.status} · success=${x.success} · code=${x.code}`
+        + ` · ${x.ms}ms · 顶层=[${x.keys}] · data=[${x.dataKeys}] · ${x.head}`, 'INFO', 'QWEN');
+    }
+  } catch (e) {
+    logRun(`[普查] 异常：${String(e?.message ?? e)}`, 'WARN', 'QWEN');
+  }
+}
+setProbeApis(probeApis);
 // 异常专用：连 stack 一起记，只看 message 往往定位不到行号
 function logEx(prefix, e, tag = 'EXC') {
   const msg = e?.message ?? e;
@@ -434,8 +457,11 @@ async function finishGeneration(meta, chatId) {
         + (probe.assistants ? '' : '（尚未开始生成，正常）'), 'INFO', 'GEN');
     } else if (probe.bizError) {
       logRun(`[探针] chatId=${chatId} 接口报业务错误：${probe.error}`, 'ERROR', 'GEN');
+      // 读会话失败时把所有候选接口都试一遍，一次日志就能定位到底是哪个环节
+      await probeApis(chatId);
     } else {
       logRun(`[探针] chatId=${chatId} 校验未通过：${probe.error}`, 'WARN', 'GEN');
+      await probeApis(chatId);
     }
     const { text, model } = await pollAnswer(chatId, {
       onTick: (len, m) => {

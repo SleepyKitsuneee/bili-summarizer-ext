@@ -26,7 +26,12 @@ async function loadCore() {
       // 用 setLogger 拿全量 stderr（传 print/printErr 会覆盖 core 自带 logger，反而丢掉输出）
       if (typeof c.setLogger === 'function') {
         c.setLogger((m) => {
-          const line = String(m ?? '').trim();
+          // ffmpeg.wasm 的 logger 可能传对象（{type,message}），直接 String() 会变成 [object Object]
+          let line;
+          if (typeof m === 'string') line = m;
+          else if (m && typeof m === 'object') line = String(m.message ?? m.text ?? m.line ?? '');
+          else line = String(m ?? '');
+          line = line.trim();
           if (!line) return;
           ffLogs.push(line);
           if (ffLogs.length > 400) ffLogs.splice(0, ffLogs.length - 400);
