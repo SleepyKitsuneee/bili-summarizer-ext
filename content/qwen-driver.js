@@ -13,6 +13,11 @@ window.__qwenDriverLoaded = true;
 // 探测应答：background 用它确认驱动脚本已就绪
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'QWEN_PING') sendResponse({ ok: true, driver: 1 });
+  // 检查 MAIN world 补丁是否就绪（background 用它决定要不要按需注入）
+  if (msg?.type === 'QWEN_PING_PATCH') {
+    sendResponse({ ok: document.documentElement.dataset?.qwenPatch === '1' });
+    return false;
+  }
   return false;
 });
 

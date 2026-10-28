@@ -321,15 +321,60 @@ async function offscreenMerge(taskId, vBuf, aBuf, onProgress, opts = {}) {
 }
 
 // ── qwen 标签页 ──
+// 等标签页加载完成。
+// ⚠️ 竞态：导航刚发起时，chrome.tabs.get() 还可能返回**旧页面**的 status==='complete'，
+// 这时会立刻误判为「已加载完」。所以要连续两次读到 complete 且 URL 没变才算稳。
 async function waitForTabComplete(tabId, maxMs = 60_000) {
   const t0 = Date.now();
+  let lastUrl = null, stableHits = 0;
   while (Date.now() - t0 < maxMs) {
     const t = await chrome.tabs.get(tabId).catch(() => null);
     if (!t) throw new Error('qwen 标签页被关闭');
-    if (t.status === 'complete') { await sleep(1500); return; }
-    await sleep(500);
+    if (t.status === 'complete') {
+      if (t.url === lastUrl) {
+        stableHits++;
+        if (stableHits >= 2) { await sleep(1200); return; }
+      } else {
+        lastUrl = t.url;
+        stableHits = 0;
+      }
+    } else {
+      stableHits = 0;
+      lastUrl = t.url;
+    }
+    await sleep(400);
   }
   throw new Error('qwen 页面加载超时');
+}
+
+// 按需注入 MAIN world 补丁（qwen-main-patch.js）。
+// 它负责拦 #filesUpload.click()、抓网络证据、抓创建会话的 chat_id。
+// 正常由 manifest 的 document_start + world:MAIN 自动注入，
+// 但扩展重载后已打开的页面里没有它 → dataset.qwenPatch 不存在 → 附件注入会失败。
+// 幂等：补丁内部有 window.__qwenPatch 守卫，重复注入安全。
+async function ensureMainPatch(tabId) {
+  try {
+    const has = await chrome.tabs.sendMessage(tabId, { type: 'QWEN_PING_PATCH' });
+    if (has?.ok) return true;
+  } catch {}
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content/qwen-main-patch.js'],
+      world: 'MAIN',
+    });
+    await sleep(300);
+    const has = await chrome.tabs.sendMessage(tabId, { type: 'QWEN_PING_PATCH' });
+    if (has?.ok) {
+      logRun(`[补丁] MAIN world 补丁按需注入成功（tabId=${tabId}）`, 'INFO', 'GEN');
+      return true;
+    }
+    logRun(`[补丁] 注入后仍未检测到（tabId=${tabId}）`, 'WARN', 'GEN');
+    return false;
+  } catch (e) {
+    logRun(`[补丁] MAIN world 注入失败：${String(e?.message ?? e)}`, 'WARN', 'GEN');
+    return false;
+  }
 }
 
 // 确认 qwen 页面的驱动脚本在线；不在就按需注入（扩展重载后旧标签页会失效）
@@ -337,61 +382,123 @@ async function pingDriver(tabId) {
   try {
     const r = await chrome.tabs.sendMessage(tabId, { type: 'QWEN_PING' });
     return !!r?.ok;
-  } catch { return false; }
+  } catch (e) {
+    pingDriver._lastErr = String(e?.message ?? e);
+    return false;
+  }
 }
 async function ensureDriver(tabId, ours) {
+  // MAIN world 补丁也要按需注入：它只在 document_start 自动注入，
+  // 扩展重载后已打开的旧页面里没有 → dataset.qwenPatch 不存在 → 附件注入会直接抛错。
+  await ensureMainPatch(tabId);
   if (await pingDriver(tabId)) return;
   // 1) 按需注入
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content/qwen-driver.js'],
-  }).catch(() => {});
-  await sleep(800);
+  let injectErr = '';
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['content/qwen-driver.js'],
+    });
+  } catch (e) { injectErr = String(e?.message ?? e); }
+  await sleep(1200);
   if (await pingDriver(tabId)) return;
-  // 2) 仍然没有（页面可能被休眠/丢弃）——只有我们自己创建的页面才重载
-  if (ours) {
-    await chrome.tabs.reload(tabId).catch(() => {});
-    await waitForTabComplete(tabId);
-    await sleep(1200);
-    if (await pingDriver(tabId)) return;
+  // 2) 仍然没有（页面可能被休眠/丢弃）——重载一次再试（自己的页面优先，用户页面也试一次）
+  logRun(`[驱动] 注入后仍未就绪，尝试重载标签页 ${tabId}`
+    + `（注入错误=${injectErr || '无'} · ping错误=${pingDriver._lastErr || '无'}）`, 'WARN', 'GEN');
+  try {
+    await chrome.tabs.reload(tabId);
+  } catch (e) {
+    logRun(`[驱动] 重载失败：${String(e?.message ?? e)}`, 'WARN', 'GEN');
   }
-  throw new Error('千问页面驱动脚本未就绪：请确认 chat.qwen.ai 标签页可正常打开并已登录');
+  await waitForTabComplete(tabId);
+  await sleep(1500);
+  if (await pingDriver(tabId)) return;
+  // 3) 再试一次注入（重载后 manifest 的 content script 应该已自动注入，
+  //    但扩展重载过的旧页面可能没有）
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['content/qwen-driver.js'] });
+  } catch {}
+  await sleep(1200);
+  if (await pingDriver(tabId)) return;
+  // 4) 最后诊断：把现场记清楚
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  logRun(`[驱动] 最终失败：tabId=${tabId} · URL=${t?.url || '(取不到)'}`
+    + ` · status=${t?.status ?? '?'} · 注入错误=${injectErr || '无'}`
+    + ` · ping错误=${pingDriver._lastErr || '无'} · 是自己创建的=${ours}`, 'ERROR', 'GEN');
+  throw new Error(`千问页面驱动脚本未就绪（tabId=${tabId}, URL=${t?.url || '未知'}）。`
+    + `请确认 chat.qwen.ai 标签页可正常打开并已登录。`);
 }
 
 let qwenTabId = null;
 let qwenTabOurs = false;
+const onQwenRoot = (u) => /^https:\/\/chat\.qwen\.ai\/?(\?.*)?$/.test(u || '');
+// 导航到首页并等它真的就绪。
+// 踩过的坑：chrome.tabs.update() 是异步的，调用后立刻 waitForTabComplete
+// 可能读到「导航还没开始」时旧页面的 status==='complete'，于是立刻返回，
+// 接着 ensureDriver 在导航中的页面上注入脚本 → 页面刷新 → driver 丢失 →
+// 「千问页面驱动脚本未就绪」。
+// 正确做法：先等 URL 变成目标地址，再等 status 变 complete，最后再等一拍。
+async function gotoQwenHome(tabId) {
+  await chrome.tabs.update(tabId, { url: QWEN_HOME }).catch(() => {});
+  const t0 = Date.now();
+  for (;;) {                                   // 等 URL 真的变成首页（最多 10s）
+    const t = await chrome.tabs.get(tabId).catch(() => null);
+    if (!t) break;
+    if (onQwenRoot(t.url || '')) break;
+    if (Date.now() - t0 > 10_000) break;
+    await sleep(200);
+  }
+  await waitForTabComplete(tabId);
+  await sleep(1000);                            // 给 content script 注入留时间
+}
 // 每次任务都开新会话：只要标签页停在某个会话页（/c/xxx），就导航回首页
 async function ensureQwenTab() {
   const isChatPage = (u) => /chat\.qwen\.ai\/c\//.test(u || '');
-  const onQwenRoot = (u) => /^https:\/\/chat\.qwen\.ai\/?(\?.*)?$/.test(u || '');
   // 优先复用我们自己创建的标签页
   if (qwenTabId != null) {
     const t = await chrome.tabs.get(qwenTabId).catch(() => null);
     if (t) {
-      if (!onQwenRoot(t.url)) await chrome.tabs.update(qwenTabId, { url: QWEN_HOME });   // 新会话
-      await waitForTabComplete(qwenTabId);
-      await ensureDriver(qwenTabId, qwenTabOurs);
-      return qwenTabId;
+      try {
+        if (!onQwenRoot(t.url)) await gotoQwenHome(qwenTabId);   // 新会话
+        else await sleep(300);
+        await ensureDriver(qwenTabId, qwenTabOurs);
+        return qwenTabId;
+      } catch (e) {
+        // 兜底：这个标签页的驱动脚本起不来（页面休眠/被丢弃/扩展重载后失效）→ 换一个新页
+        logRun(`[标签页] 复用标签页 ${qwenTabId} 失败：${String(e?.message ?? e)}`
+          + ` · 改用新标签页重试`, 'WARN', 'GEN');
+        qwenTabId = null;
+      }
+    } else {
+      qwenTabId = null;
     }
-    qwenTabId = null;
   }
-  // 复用用户已打开的千问页（只在新会话需要时导航，保证"每次总结一个新会话"）
+  // 复用用户已打开的千问页（只在新会话需要时导航，保证「每次总结一个新会话」）
   const tabs = await chrome.tabs.query({ url: ['https://chat.qwen.ai/*'] });
   if (tabs.length) {
-    qwenTabId = tabs[0].id;
+    const t0 = tabs[0].id;
     qwenTabOurs = false;
-    await chrome.tabs.update(qwenTabId, { pinned: true }).catch(() => {});
-    if (isChatPage(tabs[0].url) || !onQwenRoot(tabs[0].url)) {
-      await chrome.tabs.update(qwenTabId, { url: QWEN_HOME });
+    try {
+      await chrome.tabs.update(t0, { pinned: true }).catch(() => {});
+      if (isChatPage(tabs[0].url) || !onQwenRoot(tabs[0].url)) {
+        await gotoQwenHome(t0);
+      } else {
+        await sleep(300);
+      }
+      await ensureDriver(t0, false);
+      qwenTabId = t0;
+      return t0;
+    } catch (e) {
+      logRun(`[标签页] 用户标签页 ${t0} 不可用：${String(e?.message ?? e)}`
+        + ` · 改开新标签页`, 'WARN', 'GEN');
     }
-    await waitForTabComplete(qwenTabId);
-    await ensureDriver(qwenTabId, false);
-    return qwenTabId;
   }
+  // 新开一个千问标签页
   const tab = await chrome.tabs.create({ url: QWEN_HOME, active: false, pinned: true });
   qwenTabId = tab.id;
   qwenTabOurs = true;
-  await waitForTabComplete(qwenTabId);
+  await waitForTabComplete(tab.id);
+  await sleep(1200);
   await ensureDriver(qwenTabId, true);
   return qwenTabId;
 }
@@ -581,10 +688,17 @@ async function saveHistory(rec) {
 
 // ── 千问阶段全局排队（同一个 qwen 标签页不能被两个任务同时驱动）──
 let qwenChain = Promise.resolve();
+let qwenBusy = false;                // 当前是否有千问阶段正在跑
 function enqueueQwen(fn) {
+  // 只有前一个任务真的还在跑才提示排队。
+  // 旧写法 `if (qwenChain !== run)` 永远为真（qwenChain 被赋成 run.catch()，是另一个 Promise），
+  // 导致每次都误报「已有任务在跑，本任务排队等待」，掩盖真实时序。
+  const busy = qwenBusy;
   const run = qwenChain.then(fn);
   qwenChain = run.catch(() => {});
-  if (qwenChain !== run) logRun('[队列] 千问阶段已有任务在跑，本任务排队等待');
+  qwenBusy = true;
+  run.finally(() => { qwenBusy = false; });
+  if (busy) logRun('[队列] 千问阶段已有任务在跑，本任务排队等待');
   return run;
 }
 
