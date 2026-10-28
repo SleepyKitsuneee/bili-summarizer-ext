@@ -468,94 +468,100 @@ const onQwenRoot = (u) => /^https:\/\/chat\.qwen\.ai\/?(\?.*)?$/.test(u || '');
 // 可能读到「导航还没开始」时旧页面的 status==='complete'，于是立刻返回，
 // 接着 ensureDriver 在导航中的页面上注入脚本 → 页面刷新 → driver 丢失 →
 // 「千问页面驱动脚本未就绪」。
-// 正确做法：先等 URL 变成目标地址，再等 status 变 complete，最后再等一拍。
-async function gotoQwenHome(tabId) {
-  await chrome.tabs.update(tabId, { url: QWEN_HOME }).catch(() => {});
-  const t0 = Date.now();
-  for (;;) {                                   // 等 URL 真的变成首页（最多 10s）
-    const t = await chrome.tabs.get(tabId).catch(() => null);
-    if (!t) break;
-    if (onQwenRoot(t.url || '')) break;
-    if (Date.now() - t0 > 10_000) break;
-    await sleep(200);
-  }
-  await waitForTabComplete(tabId);
-  await sleep(1000);                            // 给 content script 注入留时间
-  // 等页面真的可用（后台标签页首屏可能弹「网络错误」toast，几秒后自动消失）
-  const ready = await checkQwenPageReady(tabId);
-  if (!ready.ok) {
-    // 页面有网络错误 → 重载一次再等
-    logRun('[页面] 首屏未就绪，重载一次再试', 'WARN', 'GEN');
-    await chrome.tabs.reload(tabId).catch(() => {});
-    await waitForTabComplete(tabId);
-    await sleep(1500);
-    const again = await checkQwenPageReady(tabId);
-    if (!again.ok) logRun('[页面] 重载后仍未就绪，继续尝试（不阻断）', 'WARN', 'GEN');
+// 找到（或创建）**唯一一个**千问标签页，全程后台静默，不抢用户当前标签页。
+// 需求：① 千问页不要突然切到前台；② 每次运行都开新标签页 → 改成只用一个。
+// 做法：
+//   · 优先用已记录的 qwenTabId，其次用已打开的 chat.qwen.ai 标签页，都没有才新建
+//   · 新建时用 active:false（后台），再用 CDP 激活页面（Emulation.setFocusEmulationEnabled
+//     + Page.setWebLifecycleState）——后台标签页被浏览器限流会弹「网络错误」toast，
+//     CDP 能让它保持 active 且不抢焦点，这是 lib/cdp.js 已经在用的成熟方案。
+//   · 每次任务前把页面导航回首页（保证「每次总结一个新会话」），但导航期间也要 CDP 保活
+let cdpKeepAlive = null;              // 当前千问页的 CDP 会话（保活用）
+let cdpKeepAliveTimer = null;         // 空闲多久后释放（避免浏览器一直显示「正在调试」提示条）
+
+async function cdpKeepAliveOn(tabId) {
+  try {
+    // 已经在保活同一个标签页就不用重复 attach
+    if (cdpKeepAlive) {
+      cdpKeepAliveTimer && clearTimeout(cdpKeepAliveTimer);
+      cdpKeepAliveTimer = setTimeout(cdpKeepAliveOff, 120_000);   // 空闲 2 分钟释放
+      return;
+    }
+    cdpKeepAlive = await cdpEnsureActive(tabId, 3, (m) => logRun(`[CDP-保活] ${m}`, 'DEBUG', 'CDP'));
+    logRun(`[CDP-保活] 已激活千问页 ${tabId}（第 ${cdpKeepAlive.attempts} 次）· 状态=${JSON.stringify(cdpKeepAlive.state)}`, 'INFO', 'CDP');
+    cdpKeepAliveTimer && clearTimeout(cdpKeepAliveTimer);
+    cdpKeepAliveTimer = setTimeout(cdpKeepAliveOff, 120_000);
+  } catch (e) {
+    logRun(`[CDP-保活] 激活失败：${String(e?.message ?? e)}`, 'WARN', 'CDP');
+    cdpKeepAlive = null;
   }
 }
-// 每次任务都开新会话：只要标签页停在某个会话页（/c/xxx），就导航回首页
+function cdpKeepAliveOff() {
+  if (cdpKeepAliveTimer) { clearTimeout(cdpKeepAliveTimer); cdpKeepAliveTimer = null; }
+  if (!cdpKeepAlive) return;
+  try { cdpKeepAlive.detach(); } catch {}
+  cdpKeepAlive = null;
+  logRun('[CDP-保活] 已释放（空闲超时，浏览器不再显示调试提示条）', 'INFO', 'CDP');
+}
+
 async function ensureQwenTab() {
   const isChatPage = (u) => /chat\.qwen\.ai\/c\//.test(u || '');
-  // 优先复用我们自己创建的标签页
-  if (qwenTabId != null) {
-    const t = await chrome.tabs.get(qwenTabId).catch(() => null);
-    if (t) {
-      try {
-        if (!onQwenRoot(t.url)) await gotoQwenHome(qwenTabId);   // 新会话
-        else await sleep(300);
-        await ensureDriver(qwenTabId, qwenTabOurs);
-        return qwenTabId;
-      } catch (e) {
-        // 兜底：这个标签页的驱动脚本起不来（页面休眠/被丢弃/扩展重载后失效）→ 换一个新页
-        logRun(`[标签页] 复用标签页 ${qwenTabId} 失败：${String(e?.message ?? e)}`
-          + ` · 改用新标签页重试`, 'WARN', 'GEN');
-        qwenTabId = null;
-      }
-    } else {
-      qwenTabId = null;
+  // ① 优先用已记录的标签页
+  let tabId = null;
+  if (qwenTabId != null && await chrome.tabs.get(qwenTabId).catch(() => null)) {
+    tabId = qwenTabId;
+  } else {
+    qwenTabId = null;
+    // ② 其次用已打开的 chat.qwen.ai 标签页（用户自己开的那个）
+    const tabs = await chrome.tabs.query({ url: ['https://chat.qwen.ai/*'] });
+    if (tabs.length) {
+      tabId = tabs[0].id;
+      qwenTabOurs = false;
+      logRun(`[标签页] 复用已打开的千问标签页 ${tabId}`, 'INFO', 'GEN');
     }
   }
-  // 复用用户已打开的千问页（只在新会话需要时导航，保证「每次总结一个新会话」）
-  const tabs = await chrome.tabs.query({ url: ['https://chat.qwen.ai/*'] });
-  if (tabs.length) {
-    const t0 = tabs[0].id;
-    qwenTabOurs = false;
-    try {
-      await chrome.tabs.update(t0, { pinned: true }).catch(() => {});
-      if (isChatPage(tabs[0].url) || !onQwenRoot(tabs[0].url)) {
-        await gotoQwenHome(t0);
-      } else {
-        await sleep(300);
-      }
-      await ensureDriver(t0, false);
-      qwenTabId = t0;
-      return t0;
-    } catch (e) {
-      logRun(`[标签页] 用户标签页 ${t0} 不可用：${String(e?.message ?? e)}`
-        + ` · 改开新标签页`, 'WARN', 'GEN');
+  // ③ 都没有 → 新建一个（后台打开，不抢焦点）
+  if (tabId == null) {
+    const tab = await chrome.tabs.create({ url: QWEN_HOME, active: false, pinned: true });
+    tabId = tab.id;
+    qwenTabOurs = true;
+    qwenTabId = tabId;
+    logRun(`[标签页] 新建千问标签页 ${tabId}（后台打开，不抢焦点）`, 'INFO', 'GEN');
+    await waitForTabComplete(tabId);
+    await sleep(1000);
+    // 后台标签页会被限流 → 用 CDP 激活，让它正常加载
+    await cdpKeepAliveOn(tabId);
+    const ready = await checkQwenPageReady(tabId);
+    if (!ready.ok) {
+      logRun('[页面] 新标签页首屏未就绪，重载一次再试', 'WARN', 'GEN');
+      await chrome.tabs.reload(tabId).catch(() => {});
+      await waitForTabComplete(tabId);
+      await sleep(1500);
+      await cdpKeepAliveOn(tabId);
+      await checkQwenPageReady(tabId);
     }
   }
-  // 新开一个千问标签页。
-  // ⚠️ 用 active: true 打开：后台标签页（active:false）首屏会被浏览器限流，
-  // 页面弹「网络错误」toast（几秒后自动消失，页面随后恢复正常），
-  // 旧对话也加载不出来。让它先在前台正常加载完，再切到后台。
-  const tab = await chrome.tabs.create({ url: QWEN_HOME, active: true, pinned: true });
-  qwenTabId = tab.id;
-  qwenTabOurs = true;
-  await waitForTabComplete(tab.id);
-  await sleep(1200);
-  const ready = await checkQwenPageReady(tab.id);
-  if (!ready.ok) {
-    logRun('[页面] 新标签页首屏未就绪，重载一次再试', 'WARN', 'GEN');
-    await chrome.tabs.reload(tab.id).catch(() => {});
-    await waitForTabComplete(tab.id);
-    await sleep(1500);
-    await checkQwenPageReady(tab.id);
+  // ④ 导航回首页（保证每次是新会话）；导航期间也要 CDP 保活，否则后台页会被限流
+  const t = await chrome.tabs.get(tabId).catch(() => null);
+  if (t && !onQwenRoot(t.url || '')) {
+    logRun(`[标签页] 导航回首页（当前 ${t.url}）`, 'INFO', 'GEN');
+    await chrome.tabs.update(tabId, { url: QWEN_HOME }).catch(() => {});
+    const t0 = Date.now();
+    for (;;) {
+      const tt = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tt) break;
+      if (onQwenRoot(tt.url || '')) break;
+      if (Date.now() - t0 > 10_000) break;
+      await sleep(200);
+    }
+    await waitForTabComplete(tabId);
+    await sleep(800);
+    await cdpKeepAliveOn(tabId);          // 导航后重新保活
+    await checkQwenPageReady(tabId);
   }
-  await ensureDriver(qwenTabId, true);
-  // 加载好了再切到后台（不要抢用户当前标签页）
-  await chrome.tabs.update(qwenTabId, { active: false }).catch(() => {});
-  return qwenTabId;
+  await ensureDriver(tabId, qwenTabOurs);
+  qwenTabId = tabId;
+  return tabId;
 }
 
 // 触发页面流程；chatId/错误通过 storage 会话键回传——
@@ -827,16 +833,24 @@ async function runTask(url, tabId) {
       meta.qwenTabId = qtab;
       await setActiveTask(meta);                     // 补上 qwenTabId
 
-      // 零跳转保活：先给千问标签页附加调试器并**验证**页面已变为 visible，
-      // 否则页面 JS 会被后台节流（上传管线冻结）。用户视图完全不动。
+      // 零跳转保活：千问页已由 ensureQwenTab 用 CDP 激活过（后台标签页不被节流）。
+      // 这里若保活会话还在就直接复用 —— 同一标签页不能同时 attach 两次调试器。
       let cdp = null;
-      try {
-        cdp = await cdpEnsureActive(qtab, 4, (m) => logRun(`[CDP] ${m}`, 'DEBUG', 'CDP'));
-        logRun(`[CDP] 附加成功（第 ${cdp.attempts} 次）· 页面状态=${JSON.stringify(cdp.state)}`, 'INFO', 'CDP');
-        report(tabId, '上传到千问', `页面已激活（第 ${cdp.attempts} 次附加成功）`);
-      } catch (e) {
-        logEx('[CDP] 激活失败', e, 'CDP');
-        report(tabId, '上传到千问', `未能激活页面（${e.message}），上传可能变慢`);
+      let ownsCdp = false;
+      if (cdpKeepAlive) {
+        cdp = cdpKeepAlive;
+        logRun(`[CDP] 复用保活会话 · 页面状态=${JSON.stringify(cdp.state)}`, 'INFO', 'CDP');
+        report(tabId, '上传到千问', '页面已激活（复用保活会话）');
+      } else {
+        try {
+          cdp = await cdpEnsureActive(qtab, 4, (m) => logRun(`[CDP] ${m}`, 'DEBUG', 'CDP'));
+          ownsCdp = true;
+          logRun(`[CDP] 附加成功（第 ${cdp.attempts} 次）· 页面状态=${JSON.stringify(cdp.state)}`, 'INFO', 'CDP');
+          report(tabId, '上传到千问', `页面已激活（第 ${cdp.attempts} 次附加成功）`);
+        } catch (e) {
+          logEx('[CDP] 激活失败', e, 'CDP');
+          report(tabId, '上传到千问', `未能激活页面（${e.message}），上传可能变慢`);
+        }
       }
 
       try {
@@ -847,8 +861,9 @@ async function runTask(url, tabId) {
         report(tabId, '发送给模型', '提交提问…');
         return await askTab(qtab, tabId, { fileName: name, model: useModel, prompt });
       } finally {
-        cdp?.detach();                               // 发送完即解除，提示条消失
-        logRun('[CDP] 调试器已解除', 'DEBUG', 'CDP');
+        // 只解除本次自己 attach 的；保活会话留给下次任务复用
+        if (ownsCdp) { try { cdp?.detach(); } catch {} }
+        logRun('[CDP] 调试器已解除（保活会话保留）', 'DEBUG', 'CDP');
       }
     });
     merged = null;
@@ -1019,5 +1034,11 @@ chrome.runtime.onStartup.addListener(() => ensureDNR().catch(() => {}));
 chrome.tabs.onRemoved.addListener((tabId) => {
   taskStates.delete(tabId);
   chrome.storage.session.remove(STATE_KEY(tabId)).catch(() => {});
+  // 千问标签页被关掉了 → 忘掉它，下次会重新找/新建
+  if (tabId === qwenTabId) {
+    logRun(`[标签页] 千问标签页 ${tabId} 已被关闭，下次会重新准备`, 'INFO', 'GEN');
+    qwenTabId = null;
+    cdpKeepAliveOff();
+  }
 });
 ensureDNR().catch(() => {});

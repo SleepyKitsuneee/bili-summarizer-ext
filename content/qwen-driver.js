@@ -152,7 +152,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     }
     return;
   }
-  // ── 诊断：探测多个候选接口，找出哪个能读到会话 ──  if (msg?.type === 'QWEN_PROBE_APIS') {
+  // ── 诊断：探测多个候选接口，找出哪个能读到会话 ──
+  if (msg?.type === 'QWEN_PROBE_APIS') {
     (async () => {
       const id = msg.chatId;
       const candidates = [
