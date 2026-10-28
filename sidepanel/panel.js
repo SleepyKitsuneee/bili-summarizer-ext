@@ -98,12 +98,15 @@ function renderResult(data, opts = {}) {
 }
 
 // ── 历史 ──
+const HIST_SHOW = 5;                  // 默认只显示最近 5 条，其余折叠
+let histExpanded = false;             // 本次会话内是否已展开
 async function loadHistory() {
   const { history = [] } = await chrome.storage.local.get('history');
   const ul = $('#hist');
   ul.innerHTML = '';
   $('#hist-empty').classList.toggle('hidden', history.length > 0);
-  history.forEach((rec, i) => {
+  const shown = histExpanded ? history : history.slice(0, HIST_SHOW);
+  shown.forEach((rec, i) => {
     const li = document.createElement('li');
     li.innerHTML = `<img src="${rec.thumb || ''}" onerror="this.style.visibility='hidden'">
       <div><div class="t">${esc(rec.title || '(未命名)')}</div>
@@ -117,7 +120,21 @@ async function loadHistory() {
     });
     ul.appendChild(li);
   });
+  // 折叠/展开按钮（条数超过 5 才出现）
+  const more = $('#hist-more');
+  if (history.length > HIST_SHOW) {
+    more.classList.remove('hidden');
+    more.textContent = histExpanded
+      ? '收起'
+      : `展开全部（共 ${history.length} 条，只列最近 ${HIST_SHOW} 条）`;
+  } else {
+    more.classList.add('hidden');
+  }
 }
+$('#hist-more').addEventListener('click', () => {
+  histExpanded = !histExpanded;
+  loadHistory();
+});
 
 // ── 与 background 通信（按标签页隔离）──
 let busy = false;
