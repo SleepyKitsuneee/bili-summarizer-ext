@@ -478,19 +478,34 @@ const onQwenRoot = (u) => /^https:\/\/chat\.qwen\.ai\/?(\?.*)?$/.test(u || '');
 //   · 每次任务前把页面导航回首页（保证「每次总结一个新会话」），但导航期间也要 CDP 保活
 let cdpKeepAlive = null;              // 当前千问页的 CDP 会话（保活用）
 let cdpKeepAliveTimer = null;         // 空闲多久后释放（避免浏览器一直显示「正在调试」提示条）
+let cdpKeepAliveHeartbeat = null;     // 心跳：定期重新 apply 焦点模拟，防止被浏览器重新节流
 
-async function cdpKeepAliveOn(tabId) {
+async function cdpKeepAliveOn(tabId, { force = false } = {}) {
   try {
-    // 已经在保活同一个标签页就不用重复 attach
-    if (cdpKeepAlive) {
+    if (cdpKeepAlive && !force) {
+      // 已有会话：只要重新 apply 一次焦点模拟即可（心跳）
+      try {
+        await cdpKeepAlive.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+        await cdpKeepAlive.send('Page.setWebLifecycleState', { state: 'active' });
+      } catch {}
       cdpKeepAliveTimer && clearTimeout(cdpKeepAliveTimer);
-      cdpKeepAliveTimer = setTimeout(cdpKeepAliveOff, 120_000);   // 空闲 2 分钟释放
+      cdpKeepAliveTimer = setTimeout(cdpKeepAliveOff, 120_000);
+      cdpKeepAliveHeartbeat && clearInterval(cdpKeepAliveHeartbeat);
+      cdpKeepAliveHeartbeat = setInterval(() => {
+        cdpKeepAlive?.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+      }, 10_000);
       return;
     }
+    // 需要新 attach（force=true：导航后重挂）
+    if (cdpKeepAlive) { try { cdpKeepAlive.detach(); } catch {} cdpKeepAlive = null; }
     cdpKeepAlive = await cdpEnsureActive(tabId, 3, (m) => logRun(`[CDP-保活] ${m}`, 'DEBUG', 'CDP'));
     logRun(`[CDP-保活] 已激活千问页 ${tabId}（第 ${cdpKeepAlive.attempts} 次）· 状态=${JSON.stringify(cdpKeepAlive.state)}`, 'INFO', 'CDP');
     cdpKeepAliveTimer && clearTimeout(cdpKeepAliveTimer);
     cdpKeepAliveTimer = setTimeout(cdpKeepAliveOff, 120_000);
+    cdpKeepAliveHeartbeat && clearInterval(cdpKeepAliveHeartbeat);
+    cdpKeepAliveHeartbeat = setInterval(() => {
+      cdpKeepAlive?.send('Emulation.setFocusEmulationEnabled', { enabled: true }).catch(() => {});
+    }, 10_000);
   } catch (e) {
     logRun(`[CDP-保活] 激活失败：${String(e?.message ?? e)}`, 'WARN', 'CDP');
     cdpKeepAlive = null;
@@ -498,14 +513,34 @@ async function cdpKeepAliveOn(tabId) {
 }
 function cdpKeepAliveOff() {
   if (cdpKeepAliveTimer) { clearTimeout(cdpKeepAliveTimer); cdpKeepAliveTimer = null; }
+  if (cdpKeepAliveHeartbeat) { clearInterval(cdpKeepAliveHeartbeat); cdpKeepAliveHeartbeat = null; }
   if (!cdpKeepAlive) return;
   try { cdpKeepAlive.detach(); } catch {}
   cdpKeepAlive = null;
   logRun('[CDP-保活] 已释放（空闲超时，浏览器不再显示调试提示条）', 'INFO', 'CDP');
 }
 
+// 最后的兜底：把千问标签页切到前台一小会儿再切回。
+// 前台标签页绝对不会被 Chrome 节流，所以「切过去 2 秒再切回来」能保证
+// 页面里的 MessageChannel / fetch 全部跑完（上传、发送、生成）。
+// 代价是会短暂抢一下焦点，所以只在真的被节流时用。
+async function flashForeground(tabId, ms = 2500) {
+  const cur = await chrome.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+  const prev = cur[0]?.id ?? null;
+  try {
+    await chrome.tabs.update(tabId, { active: true }).catch(() => {});
+    await sleep(ms);
+  } finally {
+    if (prev != null && prev !== tabId) {
+      await chrome.tabs.update(prev, { active: true }).catch(() => {});
+    } else {
+      await chrome.tabs.update(tabId, { active: false }).catch(() => {});
+    }
+  }
+  logRun(`[前台闪现] 千问页 ${tabId} 已切到前台 ${ms}ms 后切回（原标签页 ${prev ?? '无'}）`, 'INFO', 'GEN');
+}
+
 async function ensureQwenTab() {
-  const isChatPage = (u) => /chat\.qwen\.ai\/c\//.test(u || '');
   // ① 优先用已记录的标签页
   let tabId = null;
   if (qwenTabId != null && await chrome.tabs.get(qwenTabId).catch(() => null)) {
@@ -529,19 +564,16 @@ async function ensureQwenTab() {
     logRun(`[标签页] 新建千问标签页 ${tabId}（后台打开，不抢焦点）`, 'INFO', 'GEN');
     await waitForTabComplete(tabId);
     await sleep(1000);
-    // 后台标签页会被限流 → 用 CDP 激活，让它正常加载
-    await cdpKeepAliveOn(tabId);
-    const ready = await checkQwenPageReady(tabId);
-    if (!ready.ok) {
-      logRun('[页面] 新标签页首屏未就绪，重载一次再试', 'WARN', 'GEN');
-      await chrome.tabs.reload(tabId).catch(() => {});
-      await waitForTabComplete(tabId);
-      await sleep(1500);
-      await cdpKeepAliveOn(tabId);
-      await checkQwenPageReady(tabId);
-    }
   }
-  // ④ 导航回首页（保证每次是新会话）；导航期间也要 CDP 保活，否则后台页会被限流
+
+  // ④ 保活（关键）：必须在**导航之前**就 attach 调试器。
+  //    Page.setWebLifecycleState('active') 只在页面加载期有效，页面加载完再调用就无效了，
+  //    于是后台标签页仍被 Chrome 节流（定时器最慢 1 次/分钟）→
+  //    表现就是「不切到千问页，它就完全不响应；一切过去立刻开始上传」。
+  //    无论标签页是新开的、复用的、还是已在首页，都必须保活。
+  await cdpKeepAliveOn(tabId);
+
+  // ⑤ 导航回首页（保证每次是新会话）
   const t = await chrome.tabs.get(tabId).catch(() => null);
   if (t && !onQwenRoot(t.url || '')) {
     logRun(`[标签页] 导航回首页（当前 ${t.url}）`, 'INFO', 'GEN');
@@ -556,9 +588,10 @@ async function ensureQwenTab() {
     }
     await waitForTabComplete(tabId);
     await sleep(800);
-    await cdpKeepAliveOn(tabId);          // 导航后重新保活
-    await checkQwenPageReady(tabId);
+    // 导航会重置页面的生命周期状态 → 强制重新 attach（Page.setWebLifecycleState 只在加载期有效）
+    await cdpKeepAliveOn(tabId, { force: true });
   }
+  await checkQwenPageReady(tabId);
   await ensureDriver(tabId, qwenTabOurs);
   qwenTabId = tabId;
   return tabId;
@@ -567,14 +600,17 @@ async function ensureQwenTab() {
 // 触发页面流程；chatId/错误通过 storage 会话键回传——
 // 不用内存握手：后台脚本中途被浏览器重启也不会丢（这是"卡在提交提问但结果已出"的根因）
 const liveAskTabs = new Set();                       // 正在等回执的 qwen 标签页（存活 runTask）
+const lastDriverBeat = new Map();                   // tabId -> driver 最后一次活动的时刻
 async function askTab(qtab, taskTabId, payload) {
   liveAskTabs.add(qtab);
+  lastDriverBeat.set(qtab, Date.now());
   logRun(`[提问] 已触发页面流程（qwenTab=${qtab}，文件=${payload.fileName}），开始轮询回执…`);
   try {
     await chrome.tabs.sendMessage(qtab, { type: 'QWEN_SEND', ...payload });
     const chatKey = 'pendingChat_' + qtab;
     const errKey = 'pendingErr_' + qtab;
     const t0 = Date.now();
+    let flashed = false;
     while (Date.now() - t0 < 15 * 60_000) {
       const got = await chrome.storage.session.get([chatKey, errKey]).catch(() => ({}));
       if (got && got[errKey]) {
@@ -588,11 +624,23 @@ async function askTab(qtab, taskTabId, payload) {
         logRun(`[提问] 收到回执 chatId=${chatId}（等待 ${((Date.now() - t0) / 1000).toFixed(1)}s）`);
         return { chatId };
       }
+      // 节流检测：driver 收到 QWEN_SEND 后会立刻 report 一个 QWEN_STEP。
+      // 如果 8 秒内毫无动静 → 页面被 Chrome 后台节流了（MessageChannel 任务不跑）。
+      // 这时把页面切到前台一小会儿，让它把活干完（前台不会被节流）。
+      const idle = Date.now() - (lastDriverBeat.get(qtab) || t0);
+      if (!flashed && idle > 8000) {
+        flashed = true;
+        logRun(`[节流] driver 已 ${(idle / 1000).toFixed(1)}s 无响应，判定页面被后台节流`
+          + ` · 切前台 ${2500}ms 让它跑起来`, 'WARN', 'GEN');
+        await flashForeground(qtab, 2500);
+        lastDriverBeat.set(qtab, Date.now());
+      }
       await sleep(3000);
     }
     throw new Error('等待发送回执超时（15 分钟）');
   } finally {
     liveAskTabs.delete(qtab);
+    lastDriverBeat.delete(qtab);
   }
 }
 
@@ -839,7 +887,13 @@ async function runTask(url, tabId) {
       let ownsCdp = false;
       if (cdpKeepAlive) {
         cdp = cdpKeepAlive;
-        logRun(`[CDP] 复用保活会话 · 页面状态=${JSON.stringify(cdp.state)}`, 'INFO', 'CDP');
+        // 自检：visibilityState 不是 visible 说明页面又被浏览器节流了 → 强制重挂
+        if (cdp.state?.v !== 'visible') {
+          logRun(`[CDP] 页面状态已变为 ${cdp.state?.v || '未知'}（被节流？）· 重新激活`, 'WARN', 'CDP');
+          await cdpKeepAliveOn(qtab, { force: true });
+          cdp = cdpKeepAlive;
+        }
+        logRun(`[CDP] 复用保活会话 · 页面状态=${JSON.stringify(cdp?.state)}`, 'INFO', 'CDP');
         report(tabId, '上传到千问', '页面已激活（复用保活会话）');
       } else {
         try {
@@ -957,6 +1011,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (msg?.type === 'QWEN_STEP') {
     // driver 上报（无 tabId 关联，广播给所有侧边栏做通用提示）
+    // 同时更新心跳：askTab 用它判断页面是否被后台节流
+    if (sender.tab?.id != null) lastDriverBeat.set(sender.tab.id, Date.now());
     return false;
   }
   if (msg?.type === 'QWEN_SENT') {
@@ -997,6 +1053,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg?.type === 'QWEN_LOG') {                    // driver 的细粒度日志
+    // driver 一有动作就会发 QWEN_LOG → 顺带当心跳用（判断页面是否被后台节流）
+    if (sender.tab?.id != null) lastDriverBeat.set(sender.tab.id, Date.now());
     logRun(`[页面] ${msg.msg}`);
     return false;
   }
