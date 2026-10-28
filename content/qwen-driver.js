@@ -118,6 +118,30 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     })();
     return true;                                     // 异步回执
   }
+  // ── 页面状态查询（判断是否真的加载好了、有没有网络错误）──
+  if (msg?.type === 'QWEN_PAGE_STATE') {
+    try {
+      const t = document.body?.innerText || '';
+      // 网络错误 / 加载失败的特征文案
+      const errHit = t.match(/(网络错误|无法访问此网站|ERR_[A-Z_]+|连接超时|请检查网络|服务暂时不可用|访问验证)/i);
+      // 登录态判断：千问首页/会话页会出现「新建对话」「我的作品」等
+      const hasLogin = /新建对话|我的作品|新 chat|发送/.test(t);
+      sendResponse({
+        ok: true,
+        href: location.href,
+        title: document.title,
+        hasBody: !!document.body,
+        textLen: t.length,
+        error: errHit ? errHit[0] : '',
+        hasLogin,
+        // 前 200 字首屏文字，便于判断页面停在哪一步
+        head: t.slice(0, 200).replace(/\s+/g, ' '),
+      });
+    } catch (e) {
+      sendResponse({ ok: false, error: String(e?.message ?? e) });
+    }
+    return;
+  }
   // ── 从页面 DOM 读答案（主方案，绕开接口鉴权）──
   if (msg?.type === 'QWEN_READ_DOM') {
     try {

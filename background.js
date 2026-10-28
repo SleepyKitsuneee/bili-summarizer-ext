@@ -429,6 +429,37 @@ async function ensureDriver(tabId, ours) {
     + `请确认 chat.qwen.ai 标签页可正常打开并已登录。`);
 }
 
+// 检查千问页面是否真的可用（不是错误页 / 网络错误提示）。
+// 实测：新开的后台标签页首屏可能弹「网络错误」toast（后台标签页被限流），
+// 提示框几秒后自动消失，页面随后恢复正常 —— 所以这里要多等一会儿再判定。
+async function checkQwenPageReady(tabId, maxMs = 30_000) {
+  const t0 = Date.now();
+  let lastState = '';
+  while (Date.now() - t0 < maxMs) {
+    const r = await chrome.tabs.sendMessage(tabId, { type: 'QWEN_PAGE_STATE' }).catch(() => null);
+    if (r?.ok) {
+      const st = `err=${r.error ? 1 : 0}·login=${r.hasLogin ? 1 : 0}·title=${(r.title || '').slice(0, 30)}`;
+      if (st !== lastState) {
+        lastState = st;
+        logRun(`[页面] 状态变化：${st} · 有正文=${r.hasBody ? 1 : 0} · 文字长度=${r.textLen || 0}`, 'DEBUG', 'GEN');
+      }
+      // 没有网络错误、且页面有实质内容 → 认为就绪
+      if (!r.error && r.hasBody && (r.textLen || 0) > 200) return { ok: true };
+    } else {
+      if (lastState !== 'no-reply') {
+        lastState = 'no-reply';
+        logRun('[页面] 还没有回复状态查询（driver 尚未就绪）', 'DEBUG', 'GEN');
+      }
+    }
+    await sleep(1000);
+  }
+  const r = await chrome.tabs.sendMessage(tabId, { type: 'QWEN_PAGE_STATE' }).catch(() => null);
+  logRun(`[页面] 等待就绪超时（${((Date.now() - t0) / 1000).toFixed(0)}s）`
+    + ` · 状态=${lastState || '未知'}`
+    + (r?.ok ? ` · 错误提示=${r.error || '无'} · 文字长度=${r.textLen || 0}` : ''), 'WARN', 'GEN');
+  return { ok: false, state: lastState, page: r };
+}
+
 let qwenTabId = null;
 let qwenTabOurs = false;
 const onQwenRoot = (u) => /^https:\/\/chat\.qwen\.ai\/?(\?.*)?$/.test(u || '');
@@ -450,6 +481,17 @@ async function gotoQwenHome(tabId) {
   }
   await waitForTabComplete(tabId);
   await sleep(1000);                            // 给 content script 注入留时间
+  // 等页面真的可用（后台标签页首屏可能弹「网络错误」toast，几秒后自动消失）
+  const ready = await checkQwenPageReady(tabId);
+  if (!ready.ok) {
+    // 页面有网络错误 → 重载一次再等
+    logRun('[页面] 首屏未就绪，重载一次再试', 'WARN', 'GEN');
+    await chrome.tabs.reload(tabId).catch(() => {});
+    await waitForTabComplete(tabId);
+    await sleep(1500);
+    const again = await checkQwenPageReady(tabId);
+    if (!again.ok) logRun('[页面] 重载后仍未就绪，继续尝试（不阻断）', 'WARN', 'GEN');
+  }
 }
 // 每次任务都开新会话：只要标签页停在某个会话页（/c/xxx），就导航回首页
 async function ensureQwenTab() {
@@ -493,13 +535,26 @@ async function ensureQwenTab() {
         + ` · 改开新标签页`, 'WARN', 'GEN');
     }
   }
-  // 新开一个千问标签页
-  const tab = await chrome.tabs.create({ url: QWEN_HOME, active: false, pinned: true });
+  // 新开一个千问标签页。
+  // ⚠️ 用 active: true 打开：后台标签页（active:false）首屏会被浏览器限流，
+  // 页面弹「网络错误」toast（几秒后自动消失，页面随后恢复正常），
+  // 旧对话也加载不出来。让它先在前台正常加载完，再切到后台。
+  const tab = await chrome.tabs.create({ url: QWEN_HOME, active: true, pinned: true });
   qwenTabId = tab.id;
   qwenTabOurs = true;
   await waitForTabComplete(tab.id);
   await sleep(1200);
+  const ready = await checkQwenPageReady(tab.id);
+  if (!ready.ok) {
+    logRun('[页面] 新标签页首屏未就绪，重载一次再试', 'WARN', 'GEN');
+    await chrome.tabs.reload(tab.id).catch(() => {});
+    await waitForTabComplete(tab.id);
+    await sleep(1500);
+    await checkQwenPageReady(tab.id);
+  }
   await ensureDriver(qwenTabId, true);
+  // 加载好了再切到后台（不要抢用户当前标签页）
+  await chrome.tabs.update(qwenTabId, { active: false }).catch(() => {});
   return qwenTabId;
 }
 
