@@ -654,6 +654,73 @@ async function clearActiveTask() {
   await chrome.storage.session.remove('activeTask').catch(() => {});
 }
 
+// ── 从千问页面 DOM 直接读答案（主方案）──
+// 为什么：读会话接口 /api/v2/chats/{id} 对扩展发起的请求恒返回 Unauthorized
+//（后端另有鉴权，桌面版能过是因为它把浏览器 cookie 复制进了 requests session）。
+// 但页面自己能拿到并渲染回答 —— 直接读 DOM 完全绕开接口鉴权，最稳。
+// 页面里的 assistant 气泡是流式渲染的，所以按「长度增长 + 不再生成中」判定完成。
+async function pollAnswerFromDom(qtab, { maxMs = 25 * 60_000, onTick } = {}) {
+  const t0 = Date.now();
+  let lastLen = 0, stable = 0, ticks = 0, errors = 0;
+  let best = '';
+  for (;;) {
+    if (Date.now() - t0 > maxMs) {
+      throw new Error(`等待页面回答超时（${ticks} 次读取，${errors} 次失败，最长 ${best.length} 字）`);
+    }
+    await sleep(3000);
+    ticks++;
+    let r = null;
+    try {
+      r = await chrome.tabs.sendMessage(qtab, { type: 'QWEN_READ_DOM' });
+    } catch (e) {
+      errors++;
+      const msg = String(e?.message ?? e);
+      if (errors <= 3 || errors % 10 === 0) {
+        logRun(`[DOM] 读取失败（累计 ${errors}）：${msg}`, 'WARN', 'GEN');
+      }
+      // 消息通道断了：驱动脚本可能掉了，重新注入后再试
+      if (errors === 3) await ensureDriver(qtab, qwenTabOurs).catch(() => {});
+      continue;
+    }
+    if (!r?.ok) {
+      errors++;
+      if (errors <= 3) logRun(`[DOM] 页面读取失败（累计 ${errors}）：${r?.error || '未知'}`, 'WARN', 'GEN');
+      continue;
+    }
+    errors = 0;
+    // 页面自己报了错（例如「输入或附件无效」）→ 立刻失败，把原文带出来
+    if (r.error) {
+      logRun(`[DOM] 页面显示错误：${r.error}`, 'ERROR', 'GEN');
+      throw new Error(`千问页面报错：${r.error}`);
+    }
+    const text = String(r.text || '').trim();
+    if (text.length > lastLen) {
+      lastLen = text.length;
+      best = text;
+      stable = 0;
+      onTick?.(text.length, '页面');
+      logRun(`[DOM] 已读到 ${text.length} 字 · 选择器=${r.via} · 节点数=${r.count}`
+        + ` · 各节点长度=[${(r.lengths || []).join(',')}]`
+        + ` · 生成中=${r.generating} · 已等待 ${((Date.now() - t0) / 1000).toFixed(0)}s`, 'DEBUG', 'GEN');
+    } else {
+      stable++;
+    }
+    // 完成判定：不再生成中 + 长度连续 2 轮没变
+    if (!r.generating && text.length > 0 && stable >= 2) {
+      logRun(`[DOM] 判定生成结束：${text.length} 字 · 稳定 ${stable} 轮`
+        + ` · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`, 'INFO', 'GEN');
+      return { text, model: '页面读取' };
+    }
+    if (r.generating) {
+      stable = 0;
+      if (ticks % 10 === 0) {
+        logRun(`[DOM] 仍在生成中…已读 ${text.length} 字`
+          + ` · 已等待 ${((Date.now() - t0) / 1000).toFixed(0)}s`, 'DEBUG', 'GEN');
+      }
+    }
+  }
+}
+
 // 生成阶段（可从任意地方恢复执行）：轮询答案 → 解析 → 入历史 → 通知
 let resuming = false;
 async function finishGeneration(meta, chatId) {
