@@ -4,7 +4,7 @@
 import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid, setLog as setBiliLog } from './lib/bilibili.js';
 import { pollAnswer, probeChat, setLog as setQwenLog, setPageFetch, setProbeApis } from './lib/qwen.js';
 import { u8ToB64, b64ToU8 } from './lib/b64.js';
-import { cdpEnsureActive } from './lib/cdp.js';
+import { cdpEnsureActive, cdpRealClick, cdpRealHover } from './lib/cdp.js';
 import { parseSummaryJson } from './lib/json.js';
 import * as dlog from './lib/dlog.js';
 
@@ -1031,6 +1031,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (job) job.reject?.(new Error('合流失败：' + msg.error));
     sendResponse({ ok: true });
     return false;
+  }
+
+  // driver 请求用 CDP 发真实鼠标事件（isTrusted=true）。
+  // 千问的 hover 展开菜单只认真实事件，合成 el.click()/dispatchEvent 会被 React 忽略。
+  if (msg?.type === 'QWEN_CDP_CLICK') {
+    (async () => {
+      try {
+        const tabId = msg.tabId ?? sender.tab?.id;
+        let cdp = cdpKeepAlive;
+        if (!cdp) { await cdpKeepAliveOn(tabId, { force: true }); cdp = cdpKeepAlive; }
+        if (msg.mode === 'hover') await cdpRealHover(cdp.send, msg.x, msg.y);
+        else await cdpRealClick(cdp.send, msg.x, msg.y, { moveOnly: !!msg.moveOnly });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message ?? e) });
+      }
+    })();
+    return true; // 异步回执
   }
 
   if (msg?.type === 'SUMMARIZE_CURRENT' || msg?.type === 'SUMMARIZE_URL') {

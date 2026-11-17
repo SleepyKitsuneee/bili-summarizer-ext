@@ -53,6 +53,14 @@ function qlog(msg) {
   console.log('[qwen-driver]', msg);
   chrome.runtime.sendMessage({ type: 'QWEN_LOG', msg }).catch(() => {});
 }
+// 请求 background 用 CDP 发真实鼠标事件（isTrusted=true）——hover 展开菜单只有真实事件有效
+function cdpMouse(x, y, mode = 'click') {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'QWEN_CDP_CLICK', x, y, mode }, (r) => {
+      resolve({ ok: !!r?.ok, error: r?.error });
+    });
+  });
+}
 
 // ── 模型选择 ──
 // 千问模型选择器（2026-11 新版）：两级悬浮菜单
@@ -182,8 +190,8 @@ async function openModelMenu() {
   return false;
 }
 
-// 展开更多模型：新版是 hover 触发的二级菜单，click 可能无效。
-// 串行尝试 hover → mousemove → click，每步后都检查目标模型是否已出现。
+// 展开更多模型：新版是 hover 触发的二级菜单，合成事件 React 不认（isTrusted=false）。
+// 用 CDP 真实鼠标事件，对所有候选坐标（按位置去重）逐个 hover → click。
 async function expandMoreModels(model) {
   const btns = allEls('*').filter(e => {
     const r = e.getBoundingClientRect();
@@ -191,31 +199,44 @@ async function expandMoreModels(model) {
     return r.width > 40 && r.height > 10 && r.top >= 0
       && t.length < 40 && /展开更多模型/.test(t);
   });
-  // 取最深层（文本最短）的那个，避免点到整个面板容器
-  btns.sort((a, b) => visibleText(a).length - visibleText(b).length);
+  btns.sort((a, b) => visibleText(a).length - visibleText(b).length); // 文本短的（叶子）优先
   if (!btns.length) {
     qlog('找不到「展开更多模型」按钮', 'WARN');
     return false;
   }
-  const btn = btns[0];
-  qlog(`展开更多模型：找到 ${btns.length} 个候选，点文本="${visibleText(btn)}" 位置=${Math.round(btn.getBoundingClientRect().left)},${Math.round(btn.getBoundingClientRect().top)}`);
-  const actions = [
-    ['hover', () => {
-      btn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-      btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-    }],
-    ['mousemove', () => btn.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }))],
-    ['click', () => btn.click()],
-  ];
-  for (const [name, fn] of actions) {
-    try { fn(); } catch {}
-    await sleep(1000);
-    if (model && findModelOptions(model).length) {
-      qlog(`展开更多模型：${name} 后目标模型出现 ✅`);
-      return true;
+  // 按中心坐标去重，并为诊断记录 class
+  const spots = [];
+  const seenXY = new Set();
+  for (const b of btns) {
+    const r = b.getBoundingClientRect();
+    const x = Math.round(r.left + r.width / 2), y = Math.round(r.top + r.height / 2);
+    const key = `${x},${y}`;
+    if (seenXY.has(key)) continue;
+    seenXY.add(key);
+    const cls = (typeof b.className === 'string' ? b.className : '').slice(0, 80);
+    spots.push({ x, y, cls, text: visibleText(b) });
+  }
+  qlog(`展开更多模型：${btns.length} 个候选 → ${spots.length} 个坐标：`
+    + spots.map(s => `(${s.x},${s.y})<${s.cls}>`).join(' '));
+  for (const s of spots) {
+    for (const mode of ['hover', 'click']) {
+      const res = await cdpMouse(s.x, s.y, mode);
+      await sleep(800);
+      if (model && findModelOptions(model).length) {
+        qlog(`展开更多模型：${mode}@(${s.x},${s.y}) 后目标出现 ✅`, 'INFO');
+        return true;
+      }
+      if (!res.ok) qlog(`CDP ${mode}@(${s.x},${s.y}) 失败：${res.error}`, 'WARN');
     }
   }
-  qlog(`展开更多模型：三种方式都试过，目标仍未出现 · 浮层=[${dumpModelMenu()}]`, 'WARN');
+  // 兜底：合成事件
+  for (const b of btns.slice(0, 3)) { try { b.click(); } catch {} }
+  await sleep(800);
+  if (model && findModelOptions(model).length) {
+    qlog('展开更多模型：合成 click 兜底成功 ✅');
+    return true;
+  }
+  qlog(`展开更多模型：全部无效 · 浮层=[${dumpModelMenu()}]`, 'WARN');
   return false;
 }
 
