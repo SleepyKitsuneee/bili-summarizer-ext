@@ -1,7 +1,7 @@
 // test-parse-json.mjs —— 验证 parseSummaryJson 的健壮性
 // 用法：node test/test-parse-json.mjs
 
-const { parseSummaryJson, isSummaryData, parseSummaryFromCandidates } = await import('../../lib/json.js');
+const { parseSummaryJson, isSummaryData, parseSummaryFromCandidates, sanitizeJson } = await import('../../lib/json.js');
 
 let pass = 0, fail = 0;
 function check(name, actual, expect) {
@@ -96,6 +96,30 @@ check('命中来源是真回答候选#2', picked?.index, 2);
 // 16) 全是模板 → null
 check('全是模板返回 null',
   parseSummaryFromCandidates([{ text: JSON.stringify(TEMPLATE) }]), null);
+
+// ── 裸引号消毒（复现真实 bug：Qwen 在字符串值里写未转义的中文引号）──
+// 17) 字符串值里有裸双引号（"8884844"、"哥又来了"）
+{
+  const broken = '{ "视频标题": "Chovy魔咒", "结论": "用谐音"8884844"调侃其无冠", "核心要点": ["副歌反复"哥又来了"", "bilibili水印"忆蓝落花""], "关键词": ["Chovy"] }';
+  const d = parseSummaryJson(broken);
+  check('裸引号消毒后能解析', d?.结论, '用谐音"8884844"调侃其无冠');
+  check('裸引号消毒保留核心要点', d?.核心要点?.[0], '副歌反复"哥又来了"');
+}
+
+// 18) 字符串值里有裸换行（拆块导致时间被折行）
+{
+  const broken = '{ "视频标题": "x", "分段摘要": [{ "时间点": "00\n:00-00\n:05", "主题": "开场", "要点": "黑屏" }] }';
+  const d = parseSummaryJson(broken);
+  check('裸换行消毒后能解析', d?.分段摘要?.[0]?.时间点, '00:00-00:05');
+}
+
+// 19) 多段重复 JSON 连在一起（模型把同一回答吐了 5 遍）→ 取第一段
+{
+  const one = JSON.stringify({ 视频标题: 'x', 结论: 'ok', 核心要点: ['a'] });
+  const many = one + ' ' + one + ' ' + one;
+  const d = parseSummaryJson(many);
+  check('多段重复取第一段', d?.结论, 'ok');
+}
 
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);
