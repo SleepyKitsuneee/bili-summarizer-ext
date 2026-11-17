@@ -1068,8 +1068,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const tabId = msg.tabId ?? sender.tab?.id;
         let cdp = cdpKeepAlive;
         if (!cdp) { await cdpKeepAliveOn(tabId, { force: true }); cdp = cdpKeepAlive; }
-        if (msg.mode === 'hover') await cdpRealHover(cdp.send, msg.x, msg.y);
-        else await cdpRealClick(cdp.send, msg.x, msg.y, { moveOnly: !!msg.moveOnly });
+        if (msg.mode === 'hover') await cdpRealHover(cdp.send, msg.x, msg.y, msg.from || null);
+        else await cdpRealClick(cdp.send, msg.x, msg.y, { moveOnly: !!msg.moveOnly, from: msg.from || null });
         sendResponse({ ok: true });
       } catch (e) {
         sendResponse({ ok: false, error: String(e?.message ?? e) });

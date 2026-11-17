@@ -54,9 +54,9 @@ function qlog(msg) {
   chrome.runtime.sendMessage({ type: 'QWEN_LOG', msg }).catch(() => {});
 }
 // 请求 background 用 CDP 发真实鼠标事件（isTrusted=true）——hover 展开菜单只有真实事件有效
-function cdpMouse(x, y, mode = 'click') {
+function cdpMouse(x, y, mode = 'click', from = null) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'QWEN_CDP_CLICK', x, y, mode }, (r) => {
+    chrome.runtime.sendMessage({ type: 'QWEN_CDP_CLICK', x, y, mode, from }, (r) => {
       resolve({ ok: !!r?.ok, error: r?.error });
     });
   });
@@ -229,19 +229,22 @@ async function expandMoreModels(model) {
     // 诊断：先从页面 DOM 看该坐标处的元素（是否还在浮层里）
     const hit = await cdpProbe(s.x, s.y);
     qlog(`CDP探针@(${s.x},${s.y}) → ${JSON.stringify(hit)}`);
+    // 两段式 hover 的起点：仍在「展开更多模型」这一行内（偏左 ~60px，
+    // 保证从浮层内部移入、产生 mouseenter，又不离开菜单触发 onMouseLeave）。
+    const from = { x: Math.max(2, s.x - 60), y: s.y };
     // 先 hover：二级菜单多为 onMouseEnter，hover 成功就停（不要再 click，click 可能收起）
-    let res = await cdpMouse(s.x, s.y, 'hover');
+    let res = await cdpMouse(s.x, s.y, 'hover', from);
     await sleep(900);
     if (model && findModelOptions(model).length) {
-      qlog(`展开更多模型：hover@(${s.x},${s.y}) 后目标出现 ✅`, 'INFO');
+      qlog(`展开更多模型：hover@(${s.x},${s.y}) from(${from.x},${from.y}) 后目标出现 ✅`, 'INFO');
       return true;
     }
     if (!res.ok) qlog(`CDP hover@(${s.x},${s.y}) 失败：${res.error}`, 'WARN');
-    // hover 不够再 click
-    res = await cdpMouse(s.x, s.y, 'click');
+    // hover 不够再 click（同样两段式）
+    res = await cdpMouse(s.x, s.y, 'click', from);
     await sleep(900);
     if (model && findModelOptions(model).length) {
-      qlog(`展开更多模型：click@(${s.x},${s.y}) 后目标出现 ✅`, 'INFO');
+      qlog(`展开更多模型：click@(${s.x},${s.y}) from(${from.x},${from.y}) 后目标出现 ✅`, 'INFO');
       return true;
     }
   }
@@ -266,38 +269,45 @@ async function ensureModel(model) {
   if (!model) return;
   if (currentModelName() === model) { qlog(`模型已是目标值「${model}」，无需切换`); return; }
   qlog(`切换模型：当前「${currentModelName() || '(空)'}」→ 目标「${model}」`);
-  const opened = await openModelMenu();
-  qlog(`模型菜单打开=${opened} · 浮层内容=[${dumpModelMenu()}]`);
-  let cands = findModelOptions(model);
-  if (!cands.length) {
-    qlog('常用列表里没找到目标模型，尝试「展开更多模型」');
-    await expandMoreModels(model);
-    qlog(`展开后浮层内容=[${dumpModelMenu()}]`);
-    cands = findModelOptions(model);
+  // 整体重试 3 轮：CDP hover 展开是间歇性竞态（同一代码三次里成功两次），
+  // 每轮都重新打开菜单、重新定位「展开更多模型」，覆盖随机失败。
+  for (let round = 1; round <= 3; round++) {
+    qlog(`模型切换第 ${round}/3 轮`);
+    // 先确保菜单处于关闭态再重开（避免上一轮残留导致 toggle 关掉）
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(300);
+    const opened = await openModelMenu();
+    qlog(`模型菜单打开=${opened} · 浮层内容=[${dumpModelMenu()}]`);
+    let cands = findModelOptions(model);
+    if (!cands.length) {
+      qlog('常用列表里没找到目标模型，尝试「展开更多模型」');
+      await expandMoreModels(model);
+      qlog(`展开后浮层内容=[${dumpModelMenu()}]`);
+      cands = findModelOptions(model);
+    }
+    // 逐个尝试候选（可能有父/子嵌套），点完检查触发器文本是否变了
+    let clicked = false;
+    for (const c of cands.slice(0, 6)) {
+      qlog(`尝试点击模型选项「${model}」（文本="${visibleText(c.el).slice(0, 50)}" 坐标 ${Math.round(c.x)},${Math.round(c.y)}）`);
+      c.el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+      c.el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      c.el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      c.el.click();
+      await sleep(1200);
+      if (currentModelName() === model) { clicked = true; break; }
+    }
+    if (!clicked && cands.length) qlog(`点过 ${Math.min(6, cands.length)} 个候选但触发器没变`, 'WARN');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(600);
+    // 验证：DOM 更新有延迟，多等几轮
+    let actual = currentModelName();
+    for (let i = 0; i < 6 && actual !== model; i++) { await sleep(500); actual = currentModelName(); }
+    if (actual === model) { qlog(`模型切换成功：${actual}（第 ${round} 轮）`); return; }
+    qlog(`第 ${round} 轮未成功（实际=「${actual}」），重开菜单再试`, 'WARN');
   }
-  // 逐个尝试候选（可能有父/子嵌套），点完检查触发器文本是否变了
-  let clicked = false;
-  for (const c of cands.slice(0, 6)) {
-    qlog(`尝试点击模型选项「${model}」（文本="${visibleText(c.el).slice(0, 50)}" 坐标 ${Math.round(c.x)},${Math.round(c.y)}）`);
-    c.el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-    c.el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    c.el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-    c.el.click();
-    await sleep(1200);
-    if (currentModelName() === model) { clicked = true; break; }
-  }
-  if (!clicked && cands.length) qlog(`点过 ${Math.min(6, cands.length)} 个候选但触发器没变`, 'WARN');
-  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-  await sleep(600);
-  // 验证：DOM 更新有延迟，多等几轮
-  let actual = currentModelName();
-  for (let i = 0; i < 6 && actual !== model; i++) { await sleep(500); actual = currentModelName(); }
-  if (actual !== model) {
-    const diag = `期望「${model}」，实际「${actual}」· 浮层=[${dumpModelMenu()}] · 触发器DOM=[${dumpTriggerDom()}]`;
-    qlog(`模型切换失败：${diag}`, 'ERROR');
-    throw new Error(`模型切换失败：${diag}`);
-  }
-  qlog(`模型切换成功：${actual}`);
+  const diag = `期望「${model}」，实际「${currentModelName()}」· 浮层=[${dumpModelMenu()}] · 触发器DOM=[${dumpTriggerDom()}]`;
+  qlog(`模型切换失败（3 轮）：${diag}`, 'ERROR');
+  throw new Error(`模型切换失败：${diag}`);
 }
 
 // ── 分块接收（background 合流后 base64 直传过来）──
