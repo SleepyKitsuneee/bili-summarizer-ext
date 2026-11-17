@@ -61,6 +61,13 @@ function cdpMouse(x, y, mode = 'click') {
     });
   });
 }
+function cdpProbe(x, y) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'QWEN_CDP_PROBE', x, y }, (r) => {
+      resolve(r?.info || { error: r?.error || 'no reply' });
+    });
+  });
+}
 
 // ── 模型选择 ──
 // 千问模型选择器（2026-11 新版）：两级悬浮菜单
@@ -219,24 +226,26 @@ async function expandMoreModels(model) {
   qlog(`展开更多模型：${btns.length} 个候选 → ${spots.length} 个坐标：`
     + spots.map(s => `(${s.x},${s.y})<${s.cls}>`).join(' '));
   for (const s of spots) {
-    for (const mode of ['hover', 'click']) {
-      const res = await cdpMouse(s.x, s.y, mode);
-      await sleep(800);
-      if (model && findModelOptions(model).length) {
-        qlog(`展开更多模型：${mode}@(${s.x},${s.y}) 后目标出现 ✅`, 'INFO');
-        return true;
-      }
-      if (!res.ok) qlog(`CDP ${mode}@(${s.x},${s.y}) 失败：${res.error}`, 'WARN');
+    // 诊断：先从页面 DOM 看该坐标处的元素（是否还在浮层里）
+    const hit = await cdpProbe(s.x, s.y);
+    qlog(`CDP探针@(${s.x},${s.y}) → ${JSON.stringify(hit)}`);
+    // 先 hover：二级菜单多为 onMouseEnter，hover 成功就停（不要再 click，click 可能收起）
+    let res = await cdpMouse(s.x, s.y, 'hover');
+    await sleep(900);
+    if (model && findModelOptions(model).length) {
+      qlog(`展开更多模型：hover@(${s.x},${s.y}) 后目标出现 ✅`, 'INFO');
+      return true;
+    }
+    if (!res.ok) qlog(`CDP hover@(${s.x},${s.y}) 失败：${res.error}`, 'WARN');
+    // hover 不够再 click
+    res = await cdpMouse(s.x, s.y, 'click');
+    await sleep(900);
+    if (model && findModelOptions(model).length) {
+      qlog(`展开更多模型：click@(${s.x},${s.y}) 后目标出现 ✅`, 'INFO');
+      return true;
     }
   }
-  // 兜底：合成事件
-  for (const b of btns.slice(0, 3)) { try { b.click(); } catch {} }
-  await sleep(800);
-  if (model && findModelOptions(model).length) {
-    qlog('展开更多模型：合成 click 兜底成功 ✅');
-    return true;
-  }
-  qlog(`展开更多模型：全部无效 · 浮层=[${dumpModelMenu()}]`, 'WARN');
+  qlog(`展开更多模型：CDP 全部无效 · 浮层=[${dumpModelMenu()}]`, 'WARN');
   return false;
 }
 

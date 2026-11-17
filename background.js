@@ -4,7 +4,7 @@
 import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid, setLog as setBiliLog } from './lib/bilibili.js';
 import { pollAnswer, probeChat, setLog as setQwenLog, setPageFetch, setProbeApis } from './lib/qwen.js';
 import { u8ToB64, b64ToU8 } from './lib/b64.js';
-import { cdpEnsureActive, cdpRealClick, cdpRealHover } from './lib/cdp.js';
+import { cdpEnsureActive, cdpRealClick, cdpRealHover, cdpProbeAt } from './lib/cdp.js';
 import { parseSummaryJson } from './lib/json.js';
 import * as dlog from './lib/dlog.js';
 
@@ -1049,6 +1049,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
     })();
     return true; // 异步回执
+  }
+  // driver 诊断：用 CDP hit-test 查某坐标处的真实元素（验证坐标系/菜单状态）
+  if (msg?.type === 'QWEN_CDP_PROBE') {
+    (async () => {
+      try {
+        const tabId = msg.tabId ?? sender.tab?.id;
+        let cdp = cdpKeepAlive;
+        if (!cdp) { await cdpKeepAliveOn(tabId, { force: true }); cdp = cdpKeepAlive; }
+        const info = await cdpProbeAt(cdp.send, msg.x, msg.y);
+        sendResponse({ ok: true, info });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e?.message ?? e) });
+      }
+    })();
+    return true;
   }
 
   if (msg?.type === 'SUMMARIZE_CURRENT' || msg?.type === 'SUMMARIZE_URL') {
