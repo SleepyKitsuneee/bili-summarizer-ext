@@ -33,6 +33,17 @@ const sleep = (ms) => new Promise((res) => {
 });
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => [...document.querySelectorAll(s)];
+// 递归收集（含 shadow DOM）——千问的新组件可能是 Web Component，
+// 菜单选项挂在 shadowRoot 里时 document.querySelectorAll 找不到。
+function allEls(sel = '*') {
+  const out = [];
+  const walk = (root) => {
+    let els; try { els = root.querySelectorAll(sel); } catch { return; }
+    for (const el of els) { out.push(el); if (el.shadowRoot) walk(el.shadowRoot); }
+  };
+  walk(document);
+  return out;
+}
 
 function report(payload) {
   chrome.runtime.sendMessage(payload).catch(() => {});
@@ -57,7 +68,7 @@ function currentModelName() {
     const el = $(s);
     if (el) { const t = visibleText(el).split('\n')[0].trim(); if (/^Qwen/i.test(t)) return t; }
   }
-  const cands = $$('div, span, button').filter(e => {
+  const cands = allEls('div, span, button').filter(e => {
     const r = e.getBoundingClientRect();
     const t = visibleText(e).split('\n')[0].trim();
     return r.top < 140 && r.width > 60 && r.width < 400 && /^Qwen[\w.\- ]+$/i.test(t);
@@ -70,7 +81,7 @@ function currentModelName() {
 // 取文本最短、面积最小的那个。返回按「命中优先级」排序的候选列表供上层逐个尝试。
 function findModelOptions(model) {
   const cands = [];
-  for (const el of $$('*')) {
+  for (const el of allEls('*')) {
     const txt = visibleText(el);
     if (!txt) continue;
     // 首行精确匹配；也接受整段文本就是模型名（带箭头/图标时可能粘连）
@@ -87,38 +98,94 @@ function findModelOptions(model) {
 }
 function findModelOption(model) { return findModelOptions(model)[0]?.el || null; }
 
-// 找到并点击当前模型的触发器（打开菜单）
-async function openModelMenu() {
-  // 1) 老选择器
-  for (const s of ['.wms-trigger', '[class*="model-select"] [class*="trigger"]', '[class*="model-trigger"]']) {
-    const el = $(s);
-    if (el) { el.click(); await sleep(1200); return true; }
+// 菜单是否真的打开了：出现≥2 个不同的 Qwen 模型名，或出现「展开更多模型」。
+// 关键：只出现当前模型名（触发器本身）不算打开——之前就在这里误判。
+function menuState() {
+  const names = new Set();
+  let hasExpand = false;
+  for (const el of allEls('div,span,button,li,[role=option],a')) {
+    const r = el.getBoundingClientRect();
+    if (r.width < 40 || r.height < 10 || r.top < 0) continue;
+    const t = visibleText(el).split('\n')[0].trim();
+    if (/^Qwen[\w.\- ]+$/i.test(t) && t.length < 60) names.add(t);
+    if (/展开更多模型|更多模型/.test(t) && t.length < 40) hasExpand = true;
   }
-  // 2) 按文本找：页面顶部当前模型名所在元素，点它或它的可点击父级
+  return { open: names.size >= 2 || hasExpand, names: [...names] };
+}
+
+// 诊断：dump 触发器附近的真实 DOM（一次性看清 class 结构，打破盲改循环）
+function dumpTriggerDom() {
   const name = currentModelName();
-  if (name) {
-    const cands = $$('div, span, button').filter(e => {
-      const r = e.getBoundingClientRect();
-      return r.top < 140 && r.width > 60 && r.width < 400 && visibleText(e).split('\n')[0].trim() === name;
-    });
-    cands.sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width);
-    for (const el of cands.slice(0, 4)) {
-      const target = el.closest('button') || el.parentElement || el;
-      target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-      target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-      target.click();
-      await sleep(1200);
-      // 菜单打开了？页面上出现了目标模型名或「展开更多模型」
-      if (findModelOption('Qwen3.8-Omni-Flash') || $$('*').some(e => visibleText(e).includes('展开更多模型'))) return true;
-    }
+  if (!name) return '(空)';
+  const cands = allEls('div,span,button').filter(e =>
+    visibleText(e).split('\n')[0].trim() === name && e.getBoundingClientRect().top < 180);
+  cands.sort((a, b) => visibleText(a).length - visibleText(b).length);
+  const anchor = cands[0];
+  if (!anchor) return '(无锚点)';
+  const parts = [];
+  let el = anchor;
+  for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
+    const cls = (typeof el.className === 'string' ? el.className : '').slice(0, 100);
+    const txt = (el.innerText || '').slice(0, 60).replace(/\s+/g, ' ');
+    parts.push(`L${i}<${el.tagName} class="${cls}">:${txt}`);
   }
+  return parts.join(' / ');
+}
+
+// 找到并点击当前模型的触发器（打开菜单）——必须验证真的打开，多策略重试。
+async function openModelMenu() {
+  let st = menuState();
+  if (st.open) { qlog(`菜单已是打开态 · 模型=[${st.names.join(',')}]`); return true; }
+  const name = currentModelName();
+  const targets = [];
+  const seen = new Set();
+  const add = (e) => { if (e && !seen.has(e)) { seen.add(e); targets.push(e); } };
+  // 1) 老选择器
+  for (const s of ['.wms-trigger', '[class*="model-select"] [class*="trigger"]', '[class*="model-trigger"]', '[class*="trigger"]']) add($(s));
+  // 2) 按文本找：当前模型名元素 + 父级 + button 祖先
+  if (name) {
+    const byText = allEls('div,span,button').filter(e => {
+      const r = e.getBoundingClientRect();
+      return r.top < 180 && r.width > 40 && r.width < 400 && visibleText(e).split('\n')[0].trim() === name;
+    });
+    byText.sort((a, b) => visibleText(a).length - visibleText(b).length);
+    for (const el of byText) { add(el); add(el.parentElement); add(el.closest('button')); }
+  }
+  qlog(`打开菜单：候选 ${targets.length} 个 · 触发器DOM=[${dumpTriggerDom()}]`);
+  // 策略 A：逐个 click（每次 click 后立刻验证；因为 click 是 toggle，
+  //          若某次误把已开的关掉，下一轮 menuState 会再次触发，不会卡死）
+  for (const el of targets.slice(0, 10)) {
+    st = menuState();
+    if (st.open) { qlog(`菜单已打开(click前已开) · 模型=[${st.names.join(',')}]`); return true; }
+    try { el.click(); } catch {}
+    await sleep(450);
+    st = menuState();
+    if (st.open) { qlog(`菜单已打开(click) · 模型=[${st.names.join(',')}]`); return true; }
+  }
+  // 策略 B：对最可信的触发器试真实鼠标事件 + hover（React 合成事件常需 pointer 序列）
+  for (const el of targets.slice(0, 3)) {
+    st = menuState();
+    if (st.open) return true;
+    try {
+      el.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+      el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      el.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+      el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+      el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    } catch {}
+    await sleep(600);
+    st = menuState();
+    if (st.open) { qlog(`菜单已打开(pointer+hover) · 模型=[${st.names.join(',')}]`); return true; }
+  }
+  qlog(`菜单打开失败 · 浮层=[${dumpModelMenu()}] · 触发器DOM=[${dumpTriggerDom()}]`, 'WARN');
   return false;
 }
 
 // 展开更多模型：新版是 hover 触发的二级菜单，click 可能无效。
 // 串行尝试 hover → mousemove → click，每步后都检查目标模型是否已出现。
 async function expandMoreModels(model) {
-  const btns = $$('*').filter(e => {
+  const btns = allEls('*').filter(e => {
     const r = e.getBoundingClientRect();
     const t = visibleText(e);
     return r.width > 40 && r.height > 10 && r.top >= 0
@@ -155,7 +222,7 @@ async function expandMoreModels(model) {
 // 诊断：按「去重后的模型名」列出浮层里所有可见项（不再按元素列，避免嵌套刷屏）
 function dumpModelMenu() {
   const seen = new Map();
-  for (const el of $$('*')) {
+  for (const el of allEls('*')) {
     const r = el.getBoundingClientRect();
     if (r.width < 40 || r.height < 10 || r.top < 0) continue;
     const t = visibleText(el).split('\n')[0].trim();
@@ -195,7 +262,11 @@ async function ensureModel(model) {
   // 验证：DOM 更新有延迟，多等几轮
   let actual = currentModelName();
   for (let i = 0; i < 6 && actual !== model; i++) { await sleep(500); actual = currentModelName(); }
-  if (actual !== model) throw new Error(`模型切换失败：期望「${model}」，实际「${actual}」· 浮层=[${dumpModelMenu()}]`);
+  if (actual !== model) {
+    const diag = `期望「${model}」，实际「${actual}」· 浮层=[${dumpModelMenu()}] · 触发器DOM=[${dumpTriggerDom()}]`;
+    qlog(`模型切换失败：${diag}`, 'ERROR');
+    throw new Error(`模型切换失败：${diag}`);
+  }
   qlog(`模型切换成功：${actual}`);
 }
 
