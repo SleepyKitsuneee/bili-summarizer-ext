@@ -33,6 +33,16 @@ function pick(nodes) {
   return (last.text.length >= best.text.length * 0.6) ? last : best;
 }
 
+// 与 driver readAnswerFromDom 一致的多 markdown 块拼接逻辑
+function joinMarkdowns(nodes) {
+  const markdowns = nodes.filter(n => /markdown/i.test(n.sel));
+  const leaf = markdowns.filter(n => !markdowns.some(m => m !== n && (n.children || []).includes(m)));
+  const parts = leaf
+    .filter(n => !/请完整观看或收听这段视频|只输出一个 JSON 对象本体/.test(n.text))
+    .map(n => n.text);
+  return parts.length ? parts.join('\n') : '';
+}
+
 let pass = 0, fail = 0;
 function check(name, actual, expect) {
   const ok = JSON.stringify(actual) === JSON.stringify(expect);
@@ -95,6 +105,37 @@ const PROMPT = '请完整观看或收听这段视频，然后严格按照下面�
 
 // 7) 空的节点列表
 check('空节点返回 null', pick([]), null);
+
+// 8) 【核心 bug 复现】一条 JSON 回答被拆成多个 markdown 块，必须拼接而非取单块
+{
+  // 真实千问把 JSON 按自然行拆成多块（日志里 7 块），用 \n 拼接即可还原
+  const lines = [
+    '{',
+    '  "结论": "值得买",',
+    '  "核心要点": ["a", "b"],',
+    '  "关键词": ["x"]',
+    '}',
+  ];
+  const json = lines.join('\n');
+  const nodes = lines.map(t => ({ sel: 'markdown', text: t, children: [] }));
+  check('多块拼接后等于完整回答', joinMarkdowns(nodes), json);
+  // 旧逻辑只取最长块 → 必然截断
+  check('旧逻辑确实会截断（对照）', pick(nodes).text === json, false);
+  // 拼接结果仍能被 JSON.parse 还原
+  let ok = false;
+  try { ok = !!JSON.parse(joinMarkdowns(nodes)); } catch {}
+  check('拼接结果可被 JSON.parse', ok, true);
+}
+
+// 9) 拼接时排除用户提示词块（含"请完整观看"）
+{
+  const json = '{"结论":"值得买"}';
+  const nodes = [
+    { sel: 'markdown', text: PROMPT, children: [] },
+    { sel: 'markdown', text: json, children: [] },
+  ];
+  check('用户提示词块被排除', joinMarkdowns(nodes), json);
+}
 
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);
