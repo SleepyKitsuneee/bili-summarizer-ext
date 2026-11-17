@@ -44,24 +44,83 @@ function qlog(msg) {
 }
 
 // ── 模型选择 ──
+// 千问模型选择器改版：变成两级悬浮菜单 —— 左栏是常用模型（Qwen3.7-Plus / Qwen4-Max /
+// Qwen3.8-Max / 展开更多模型），右栏是更多模型（Qwen3.8-Omni-Flash / Qwen3.7-Max / …）。
+// 目标模型常在右栏，必须先点「展开更多模型」；且每个选项的 innerText 含描述文字，
+// 所以按「第一行 === 模型名」匹配，不能拿整个 innerText 做严格相等。
+function currentModelName() {
+  const sels = ['.wms-trigger__text', '[class*="model-select"] [class*="trigger"]', '[class*="model-trigger"]'];
+  for (const s of sels) {
+    const el = $(s);
+    if (el) { const t = (el.innerText || '').trim(); if (t) return t; }
+  }
+  return '';
+}
+
+// 找文本第一行精确等于目标名的元素；取文本最短的那个（最贴近选项本身，避免点到整个面板容器）
+function findModelOption(model) {
+  const cands = [];
+  for (const el of $$('div, li, span, [role=option], [role=menuitem]')) {
+    const txt = (el.innerText || '').trim();
+    if (!txt) continue;
+    if (txt.split('\n')[0].trim() !== model) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 40 || r.height < 8) continue;   // 隐藏元素
+    if (txt.length > model.length + 400) continue; // 包含太多内容 → 是容器
+    cands.push({ el, len: txt.length });
+  }
+  cands.sort((a, b) => a.len - b.len);
+  return cands[0]?.el || null;
+}
+
+async function openModelMenu() {
+  const sels = ['.wms-trigger', '[class*="model-select"] [class*="trigger"]', '[class*="model-trigger"]'];
+  for (const s of sels) {
+    const el = $(s);
+    if (el) { el.click(); await sleep(1000); return true; }
+  }
+  return false;
+}
+
+async function expandMoreModels() {
+  const btn = $$('*').find(e => {
+    const t = (e.innerText || '').trim();
+    return t === '展开更多模型' && e.getBoundingClientRect().width > 0;
+  });
+  if (!btn) return false;
+  btn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+  btn.click();
+  await sleep(900);
+  return true;
+}
+
 async function ensureModel(model) {
   if (!model) return;
-  const cur = () => ($('.wms-trigger__text')?.innerText || '').trim();
-  if (cur() === model) { qlog(`模型已是目标值「${model}」，无需切换`); return; }
-  qlog(`切换模型：当前「${cur() || '(空)'}」→ 目标「${model}」`);
-  $('.wms-trigger')?.click();
-  await sleep(1200);
-  const opt = $$('.ant-dropdown li, .ant-dropdown-menu-item, [role=option], [role=menuitem]')
-    .find(e => (e.innerText || '').trim().split('\n')[0].trim() === model)
-    || $$('*').find(e => {
-      const t = (e.innerText || '').trim();
-      return t === model && e.getBoundingClientRect().width > 0;
-    });
-  if (opt) { opt.click(); await sleep(1500); }
+  if (currentModelName() === model) { qlog(`模型已是目标值「${model}」，无需切换`); return; }
+  qlog(`切换模型：当前「${currentModelName() || '(空)'}」→ 目标「${model}」`);
+  await openModelMenu();
+  qlog(`模型菜单已展开，页面可见元素文本样本：${$$('div').slice(0, 3).map(e => (e.innerText || '').trim().slice(0, 30)).join(' / ')}`);
+  let opt = findModelOption(model);
+  if (!opt) {
+    // 目标不在常用列表 → 点「展开更多模型」再找
+    qlog('常用列表里没找到目标模型，尝试点「展开更多模型」');
+    await expandMoreModels();
+    opt = findModelOption(model);
+  }
+  if (opt) {
+    qlog(`找到模型选项「${model}」（文本长度 ${(opt.innerText || '').trim().length}），点击`);
+    opt.click();
+    await sleep(1500);
+  } else {
+    qlog(`没找到模型选项「${model}」`, 'ERROR');
+  }
   document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   await sleep(600);
-  if (cur() !== model) throw new Error(`模型切换失败：期望「${model}」，实际「${cur()}」`);
-  qlog(`模型切换成功`);
+  // 验证：DOM 更新有延迟，多等几轮
+  let actual = currentModelName();
+  for (let i = 0; i < 5 && actual !== model; i++) { await sleep(500); actual = currentModelName(); }
+  if (actual !== model) throw new Error(`模型切换失败：期望「${model}」，实际「${actual}」`);
+  qlog(`模型切换成功：${actual}`);
 }
 
 // ── 分块接收（background 合流后 base64 直传过来）──
@@ -196,11 +255,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === 'QWEN_LIST_MODELS') {           // 只读模型名字给侧边栏做下拉候选
     (async () => {
       try {
-        $('.wms-trigger')?.click();
-        await sleep(1000);
-        const names = $$('.wms-list__name, [role=option], [role=menuitem]')
+        await openModelMenu();
+        // 常用列表 + 「展开更多模型」后的列表都要读
+        const collect = () => $$('div, li, [role=option], [role=menuitem]')
           .map(e => (e.innerText || '').trim().split('\n')[0].trim())
-          .filter(Boolean);
+          .filter(t => t && t.length < 60 && /^(Qwen|qwen|通义)/.test(t));
+        let names = collect();
+        await expandMoreModels();
+        names = names.concat(collect());
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
         sendResponse({ ok: true, models: [...new Set(names)].slice(0, 40) });
       } catch (e) {
