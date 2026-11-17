@@ -44,81 +44,132 @@ function qlog(msg) {
 }
 
 // ── 模型选择 ──
-// 千问模型选择器改版：变成两级悬浮菜单 —— 左栏是常用模型（Qwen3.7-Plus / Qwen4-Max /
-// Qwen3.8-Max / 展开更多模型），右栏是更多模型（Qwen3.8-Omni-Flash / Qwen3.7-Max / …）。
-// 目标模型常在右栏，必须先点「展开更多模型」；且每个选项的 innerText 含描述文字，
-// 所以按「第一行 === 模型名」匹配，不能拿整个 innerText 做严格相等。
+// 千问模型选择器（2026-11 新版）：两级悬浮菜单
+//   顶部触发器显示当前模型名 + 下拉箭头；点开后浮层左栏是常用模型，
+//   底部「展开更多模型」hover/click 后右栏出现更多模型（含 Qwen3.8-Omni-Flash）。
+// 不再依赖具体 class 名 —— 全部按可见文本定位并按几何位置过滤。
+function visibleText(el) { return (el.innerText || el.textContent || '').trim(); }
+
 function currentModelName() {
-  const sels = ['.wms-trigger__text', '[class*="model-select"] [class*="trigger"]', '[class*="model-trigger"]'];
-  for (const s of sels) {
+  // 触发器：页面顶部那个带下拉箭头、文本像模型名的元素。
+  // 优先老选择器，兜底：在页面上半部分找文本以 Qwen 开头且很短的可见元素。
+  for (const s of ['.wms-trigger__text', '[class*="trigger"] [class*="text"]']) {
     const el = $(s);
-    if (el) { const t = (el.innerText || '').trim(); if (t) return t; }
+    if (el) { const t = visibleText(el).split('\n')[0].trim(); if (/^Qwen/i.test(t)) return t; }
   }
-  return '';
+  const cands = $$('div, span, button').filter(e => {
+    const r = e.getBoundingClientRect();
+    const t = visibleText(e).split('\n')[0].trim();
+    return r.top < 140 && r.width > 60 && r.width < 400 && /^Qwen[\w.\- ]+$/i.test(t);
+  });
+  cands.sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width);
+  return cands.length ? visibleText(cands[0]).split('\n')[0].trim() : '';
 }
 
-// 找文本第一行精确等于目标名的元素；取文本最短的那个（最贴近选项本身，避免点到整个面板容器）
+// 扫描浮层里所有可见、文本首行等于模型名的元素，取文本最短的（最贴近选项本身）
 function findModelOption(model) {
   const cands = [];
-  for (const el of $$('div, li, span, [role=option], [role=menuitem]')) {
-    const txt = (el.innerText || '').trim();
-    if (!txt) continue;
-    if (txt.split('\n')[0].trim() !== model) continue;
+  for (const el of $$('div, li, span, button, [role=option], [role=menuitem]')) {
+    const txt = visibleText(el);
+    if (!txt || txt.split('\n')[0].trim() !== model) continue;
     const r = el.getBoundingClientRect();
-    if (r.width < 40 || r.height < 8) continue;   // 隐藏元素
-    if (txt.length > model.length + 400) continue; // 包含太多内容 → 是容器
-    cands.push({ el, len: txt.length });
+    if (r.width < 40 || r.height < 10 || r.top < 0) continue;
+    if (txt.length > model.length + 300) continue;   // 容器，跳过
+    cands.push({ el, len: txt.length, area: r.width * r.height });
   }
-  cands.sort((a, b) => a.len - b.len);
+  cands.sort((a, b) => a.len - b.len || a.area - b.area);
   return cands[0]?.el || null;
 }
 
+// 找到并点击当前模型的触发器（打开菜单）
 async function openModelMenu() {
-  const sels = ['.wms-trigger', '[class*="model-select"] [class*="trigger"]', '[class*="model-trigger"]'];
-  for (const s of sels) {
+  // 1) 老选择器
+  for (const s of ['.wms-trigger', '[class*="model-select"] [class*="trigger"]', '[class*="model-trigger"]']) {
     const el = $(s);
-    if (el) { el.click(); await sleep(1000); return true; }
+    if (el) { el.click(); await sleep(1200); return true; }
+  }
+  // 2) 按文本找：页面顶部当前模型名所在元素，点它或它的可点击父级
+  const name = currentModelName();
+  if (name) {
+    const cands = $$('div, span, button').filter(e => {
+      const r = e.getBoundingClientRect();
+      return r.top < 140 && r.width > 60 && r.width < 400 && visibleText(e).split('\n')[0].trim() === name;
+    });
+    cands.sort((a, b) => a.getBoundingClientRect().width - b.getBoundingClientRect().width);
+    for (const el of cands.slice(0, 4)) {
+      const target = el.closest('button') || el.parentElement || el;
+      target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+      target.click();
+      await sleep(1200);
+      // 菜单打开了？页面上出现了目标模型名或「展开更多模型」
+      if (findModelOption('Qwen3.8-Omni-Flash') || $$('*').some(e => visibleText(e).includes('展开更多模型'))) return true;
+    }
   }
   return false;
 }
 
+// 点击/悬停「展开更多模型」：文本可能带 ">" 或换行，用 includes 匹配
 async function expandMoreModels() {
-  const btn = $$('*').find(e => {
-    const t = (e.innerText || '').trim();
-    return t === '展开更多模型' && e.getBoundingClientRect().width > 0;
+  const btns = $$('div, li, span, button, a').filter(e => {
+    const r = e.getBoundingClientRect();
+    const t = visibleText(e);
+    return r.width > 40 && r.height > 10 && t.length < 30 && t.includes('展开更多模型');
   });
-  if (!btn) return false;
+  btns.sort((a, b) => visibleText(a).length - visibleText(b).length);
+  const btn = btns[0];
+  if (!btn) {
+    qlog('找不到「展开更多模型」按钮', 'WARN');
+    return false;
+  }
+  qlog(`点「展开更多模型」：文本="${visibleText(btn)}"`);
   btn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+  btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
   btn.click();
-  await sleep(900);
+  await sleep(1200);
   return true;
+}
+
+// 诊断：把当前浮层里所有含 Qwen 的可见文本记下来，一次就能看出菜单到底有没有开
+function dumpModelMenu() {
+  const items = [];
+  for (const el of $$('div, li, span, button, [role=option]')) {
+    const r = el.getBoundingClientRect();
+    const t = visibleText(el).split('\n')[0].trim();
+    if (r.width < 40 || r.height < 10 || r.top < 0) continue;
+    if (!/^(Qwen|展开更多模型)/i.test(t)) continue;
+    if (t.length > 60) continue;
+    items.push(`${t.slice(0, 40)}@${Math.round(r.left)},${Math.round(r.top)}`);
+  }
+  return [...new Set(items)].slice(0, 30).join(' | ');
 }
 
 async function ensureModel(model) {
   if (!model) return;
   if (currentModelName() === model) { qlog(`模型已是目标值「${model}」，无需切换`); return; }
   qlog(`切换模型：当前「${currentModelName() || '(空)'}」→ 目标「${model}」`);
-  await openModelMenu();
-  qlog(`模型菜单已展开，页面可见元素文本样本：${$$('div').slice(0, 3).map(e => (e.innerText || '').trim().slice(0, 30)).join(' / ')}`);
+  const opened = await openModelMenu();
+  qlog(`模型菜单打开=${opened} · 浮层内容=[${dumpModelMenu()}]`);
   let opt = findModelOption(model);
   if (!opt) {
-    // 目标不在常用列表 → 点「展开更多模型」再找
-    qlog('常用列表里没找到目标模型，尝试点「展开更多模型」');
+    qlog('常用列表里没找到目标模型，尝试「展开更多模型」');
     await expandMoreModels();
+    qlog(`展开后浮层内容=[${dumpModelMenu()}]`);
     opt = findModelOption(model);
   }
   if (opt) {
-    qlog(`找到模型选项「${model}」（文本长度 ${(opt.innerText || '').trim().length}），点击`);
+    qlog(`找到模型选项「${model}」（文本="${visibleText(opt).slice(0, 60)}"），点击`);
+    opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
     opt.click();
-    await sleep(1500);
+    await sleep(1800);
   } else {
     qlog(`没找到模型选项「${model}」`, 'ERROR');
   }
   document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   await sleep(600);
-  // 验证：DOM 更新有延迟，多等几轮
   let actual = currentModelName();
-  for (let i = 0; i < 5 && actual !== model; i++) { await sleep(500); actual = currentModelName(); }
+  for (let i = 0; i < 6 && actual !== model; i++) { await sleep(500); actual = currentModelName(); }
   if (actual !== model) throw new Error(`模型切换失败：期望「${model}」，实际「${actual}」`);
   qlog(`模型切换成功：${actual}`);
 }
