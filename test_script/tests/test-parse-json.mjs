@@ -1,7 +1,7 @@
 // test-parse-json.mjs —— 验证 parseSummaryJson 的健壮性
 // 用法：node test/test-parse-json.mjs
 
-const { parseSummaryJson } = await import('../../lib/json.js');
+const { parseSummaryJson, isSummaryData, parseSummaryFromCandidates } = await import('../../lib/json.js');
 
 let pass = 0, fail = 0;
 function check(name, actual, expect) {
@@ -63,6 +63,39 @@ check('括号未闭合 → null', parseSummaryJson('{"结论":"abc"'), null);
 // 12) 嵌套对象
 const nested = { 结论: 'ok', 分段摘要: [{ 时间点: '00:10', 主题: '开场', 要点: '介绍' }] };
 check('嵌套对象', parseSummaryJson(JSON.stringify(nested)), nested);
+
+// ── 候选甄别（复现真实 bug：提示词模板混进页面，被误当回答）──
+// 13) 模板 JSON（值都是 string｜ 占位符）不算真总结
+const TEMPLATE = {
+  _说明: '所有视频总结的统一输出格式...',
+  视频标题: 'string｜视频的实际标题', UP主: 'string', 时长: 'string',
+  内容类型: 'string｜单选一个', 结论: 'string', 核心要点: ['string'],
+  争议或不足: ['string'], 分段摘要: [{ 时间点: 'string', 主题: 'string', 要点: 'string' }],
+  关键词: ['string'],
+};
+check('模板不算真总结', isSummaryData(TEMPLATE), false);
+
+// 14) 真总结算真
+const REAL = {
+  _说明: TEMPLATE._说明, 视频标题: '', UP主: '忆蓝落花', 时长: '02:35',
+  内容类型: '游戏', 结论: '这是一支恶搞歌曲MV...', 核心要点: ['开场定调', '战绩梗'],
+  争议或不足: [], 分段摘要: [{ 时间点: '00:00', 主题: '开场', 要点: '黑屏' }], 关键词: ['Chovy'],
+};
+check('真总结算真', isSummaryData(REAL), true);
+
+// 15) 核心场景：候选里模板在前、真回答在后 → 跳模板取真回答
+const candidates = [
+  { text: '{"_说明":"所有视频总结的统一输出格式...', via: 'markdown-block' }, // 截断的模板片段
+  { text: '```json\n' + JSON.stringify(TEMPLATE) + '\n```', via: 'markdown-group' }, // 完整模板
+  { text: JSON.stringify(REAL), via: 'markdown-group' }, // 真回答
+];
+const picked = parseSummaryFromCandidates(candidates);
+check('跳过模板取真回答', picked?.data, REAL);
+check('命中来源是真回答候选#2', picked?.index, 2);
+
+// 16) 全是模板 → null
+check('全是模板返回 null',
+  parseSummaryFromCandidates([{ text: JSON.stringify(TEMPLATE) }]), null);
 
 console.log(`\n通过 ${pass}，失败 ${fail}`);
 process.exit(fail ? 1 : 0);

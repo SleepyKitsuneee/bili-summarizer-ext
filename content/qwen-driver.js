@@ -533,66 +533,76 @@ function pageError() {
 }
 
 // 从页面上提取最新的 assistant 回答（同步，一次调用拿全部信息）。
-// 关键：新版千问把一条回答拆成多个 [class*="markdown"] 块（日志里见过 7 块：
-// 131/90/90/90/41/39/39），完整 JSON 分散在这些块里。只取最长的那块会截断，
-// 必须按 DOM 顺序把同一条回答的所有 markdown 块拼起来。
+//
+// 踩过的坑（务必记住）：不要在页面里自己做「拼接 + 选一段」！
+//   · 一条回答会被千问拆成多个 [class*="markdown"] 块（见过 7/11 块）；
+//   · 用户那条 909 字提示词里本身含一段 JSON「结构模板」（值都是 "string｜..."），
+//     它也被渲染成 markdown 块，部分块不含"请完整观看"关键词，会混进来；
+//   · 结果拼出来的是模板片段 → 截断 → 解析失败。
+//
+// 正确做法：把页面上所有「可能的回答文本」原样交给后台，由后台用 parseSummaryJson
+// 逐个尝试，靠「真实值 vs string 占位符」自动挑出真正的总结 JSON。
 function readAnswerFromDom() {
-  const nodes = [];
+  const base0 = { generating: isGenerating(), error: pageError() };
+  const candidates = [];
   const seen = new Set();
-  for (const sel of ASSISTANT_SELECTORS) {
-    let list;
-    try { list = $$(sel); } catch { continue; }
+  const add = (txt, via) => {
+    if (!txt) return;
+    const t = String(txt).trim();
+    if (t && !seen.has(t)) { seen.add(t); candidates.push({ text: t, via }); }
+  };
+
+  // 1) 每个 assistant 消息容器的完整 innerText（最可靠：不会被拆块影响）
+  for (const sel of ASSISTANT_SELECTORS.filter(s => !/markdown/i.test(s))) {
+    let list; try { list = $$(sel); } catch { continue; }
     for (const n of list) {
-      if (!n || seen.has(n)) continue;
       if (isUserNode(n)) continue;
-      const txt = (n.innerText || '').trim();
-      // 不过滤短块：JSON 的 "{" / "}" 独占一行时只有 1 字符，
-      // 过早丢弃会导致拼接出的 JSON 缺头缺尾。交给后面的拼接/兜底判断。
-      if (!txt) continue;
-      seen.add(n);
-      nodes.push({ sel, node: n, text: txt });
+      add(n.innerText || n.textContent || '', sel);
     }
   }
-  const base0 = { generating: isGenerating(), error: pageError() };
-  if (!nodes.length) return { ok: false, reason: 'no-node', count: 0, ...base0 };
-
-  // 选最新的一条 assistant 消息容器：优先含 "assistant/message" 的祖先，
-  // 否则取包含这些 markdown 块的最深层公共容器。
-  // 简化且稳健的做法：把所有「叶子 markdown 块」按 DOM 顺序拼接，排除用户提示词。
-  // 叶子 = 不含其它 markdown 子块的节点（避免父子重复拼接）。
-  const markdowns = nodes.filter(n => /markdown/i.test(n.sel));
-  const leafMarkdowns = markdowns.filter(n => !markdowns.some(m => m.node !== n.node && n.node.contains(m.node)));
-  let text = '';
-  let via = '';
-  if (leafMarkdowns.length) {
-    // 按文档顺序排序
-    leafMarkdowns.sort((a, b) => {
-      if (a.node.compareDocumentPosition && (a.node.compareDocumentPosition(b.node) & Node.DOCUMENT_POSITION_FOLLOWING)) return -1;
-      if (b.node.compareDocumentPosition && (b.node.compareDocumentPosition(a.node) & Node.DOCUMENT_POSITION_FOLLOWING)) return 1;
+  // 2) 所有 markdown 块按「最近的 assistant 祖先」分组后拼接
+  //    （把同一条回答的碎块合回去，同时隔离用户消息里的模板块）
+  const groups = new Map();
+  for (const n of allEls('*')) {
+    const cls = (typeof n.className === 'string' ? n.className : '');
+    if (!/markdown/i.test(cls)) continue;
+    const r = n.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    // 找最近的 assistant 消息祖先作为分组 key
+    let anc = n, key = null;
+    for (let i = 0; i < 8 && anc; i++, anc = anc.parentElement) {
+      const ac = (typeof anc.className === 'string' ? anc.className : '') + ' ' + (anc.getAttribute?.('data-role') || '');
+      if (/assistant|message|response|ai-msg/i.test(ac) && !/user/i.test(ac)) { key = anc; break; }
+    }
+    if (!key) key = document.body;
+    if (isUserNode(key)) continue;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(n);
+  }
+  for (const [key, els] of groups) {
+    const sorted = els.slice().sort((a, b) => {
+      if (a.compareDocumentPosition && (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)) return -1;
+      if (b.compareDocumentPosition && (b.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING)) return 1;
       return 0;
     });
-    // 用户提示词可能独占一个 markdown 块（含"请完整观看"），排除它
-    const answerParts = leafMarkdowns.filter(n =>
-      !/请完整观看或收听这段视频|只输出一个 JSON 对象本体/.test(n.text));
-    const parts = (answerParts.length ? answerParts : leafMarkdowns).map(n => n.text);
-    text = parts.join('\n');
-    via = 'markdown-joined';
+    add(sorted.map(e => (e.innerText || e.textContent || '').trim()).join('\n'), 'markdown-group');
+    // 也单独加入每个块（万一某块本身就是完整 JSON）
+    for (const e of sorted) add(e.innerText || e.textContent || '', 'markdown-block');
   }
-  // 兜底：没有 markdown 块时，沿用原来的「取最长/最后一段」逻辑
-  if (!text) {
-    let best = nodes[0];
-    for (const n of nodes) if (n.text.length > best.text.length) best = n;
-    const last = nodes[nodes.length - 1];
-    const pick = (last.text.length >= best.text.length * 0.6) ? last : best;
-    text = pick.text;
-    via = pick.sel;
-  }
+  // 3) 整页兜底
+  add(document.body?.innerText || '', 'body');
+
+  if (!candidates.length) return { ok: false, reason: 'no-node', count: 0, ...base0 };
+  // text 字段保留最长的候选，仅供日志展示；真正提取由后台遍历 candidates 完成
+  let best = candidates[0];
+  for (const c of candidates) if (c.text.length > best.text.length) best = c;
   return {
     ok: true,
-    text,
-    via,
-    count: nodes.length,
-    lengths: nodes.map(n => n.text.length),
+    text: best.text,
+    via: best.via,
+    candidates,
+    count: candidates.length,
+    lengths: candidates.map(c => c.text.length),
     ...base0,
   };
 }

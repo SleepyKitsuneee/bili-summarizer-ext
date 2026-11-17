@@ -5,7 +5,7 @@ import { getVideoContext, getPlayurlDash, pickStreams, downloadStream, parseBvid
 import { pollAnswer, probeChat, setLog as setQwenLog, setPageFetch, setProbeApis } from './lib/qwen.js';
 import { u8ToB64, b64ToU8 } from './lib/b64.js';
 import { cdpEnsureActive, cdpRealClick, cdpRealHover, cdpProbeAt } from './lib/cdp.js';
-import { parseSummaryJson } from './lib/json.js';
+import { parseSummaryJson, parseSummaryFromCandidates } from './lib/json.js';
 import * as dlog from './lib/dlog.js';
 
 const OFFSCREEN = 'offscreen/offscreen.html';
@@ -663,6 +663,7 @@ async function pollAnswerFromDom(qtab, { maxMs = 25 * 60_000, onTick } = {}) {
   const t0 = Date.now();
   let lastLen = 0, stable = 0, ticks = 0, errors = 0;
   let best = '';
+  let lastCandidates = [];   // 页面每轮返回的所有候选文本（回答可能被拆成多块）
   for (;;) {
     if (Date.now() - t0 > maxMs) {
       throw new Error(`等待页面回答超时（${ticks} 次读取，${errors} 次失败，最长 ${best.length} 字）`);
@@ -693,6 +694,7 @@ async function pollAnswerFromDom(qtab, { maxMs = 25 * 60_000, onTick } = {}) {
       logRun(`[DOM] 页面显示错误：${r.error}`, 'ERROR', 'GEN');
       throw new Error(`千问页面报错：${r.error}`);
     }
+    lastCandidates = Array.isArray(r.candidates) ? r.candidates : [];
     const text = String(r.text || '').trim();
     if (text.length > lastLen) {
       lastLen = text.length;
@@ -705,11 +707,27 @@ async function pollAnswerFromDom(qtab, { maxMs = 25 * 60_000, onTick } = {}) {
     } else {
       stable++;
     }
-    // 完成判定：不再生成中 + 长度连续 2 轮没变
-    if (!r.generating && text.length > 0 && stable >= 2) {
+    // 关键改进：先看候选里有没有「能解析出真总结」的——
+    // 页面把回答拆成多块且提示词模板也混在 DOM 里，单看某一块会截到模板片段。
+    // 逐个候选交给 parseSummaryFromCandidates，它靠真实值 vs string 占位符挑出真回答。
+    const parsed = parseSummaryFromCandidates(lastCandidates);
+    // 完成判定：不再生成中 +（解析到真总结 或 长度连续 2 轮没变）
+    if (!r.generating && text.length > 0 && (parsed || stable >= 2)) {
       logRun(`[DOM] 判定生成结束：${text.length} 字 · 稳定 ${stable} 轮`
+        + ` · 命中总结JSON=${parsed ? `是(候选#${parsed.index}/${parsed.source})` : '否'}`
+        + ` · 候选数=${lastCandidates.length}`
         + ` · 耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`, 'INFO', 'GEN');
-      return { text, model: '页面读取' };
+      return {
+        text,
+        model: '页面读取',
+        earlyData: parsed?.data || null,
+        earlyRaw: parsed?.source || '',
+      };
+    }
+    // 生成中但已经解析到真总结——也提前锁定（流式时生成按钮可能残留几秒）
+    if (r.generating && parsed) {
+      logRun(`[DOM] 生成中但已解析到完整总结（候选#${parsed.index}），提前锁定`, 'INFO', 'GEN');
+      return { text, model: '页面读取', earlyData: parsed.data, earlyRaw: parsed.source };
     }
     if (r.generating) {
       stable = 0;
@@ -732,7 +750,7 @@ async function finishGeneration(meta, chatId) {
   try {
     report(meta.taskTabId, 'AI 生成', '正在等待生成结果…');
     // 主方案：从千问页面 DOM 直接读（绕开接口鉴权）
-    let text = '', model = '页面读取';
+    let text = '', model = '页面读取', earlyData = null, earlyRaw = '';
     const qtab = meta.qwenTabId ?? qwenTabId;
     if (qtab != null) {
       try {
@@ -743,6 +761,8 @@ async function finishGeneration(meta, chatId) {
           },
         });
         text = r.text; model = r.model;
+        earlyData = r.earlyData || null;
+        earlyRaw = r.earlyRaw || '';
       } catch (e) {
         logEx('[DOM] 读取失败，回退到接口轮询', e, 'GEN');
       }
@@ -766,13 +786,20 @@ async function finishGeneration(meta, chatId) {
       });
       text = r.text; model = r.model;
     }
-    logRun(`[生成] 回答完成：${text.length} 字 · 模型=${model} · 耗时 ${((Date.now() - gT0) / 1000).toFixed(1)}s`, 'INFO', 'GEN');
-    logRun(`[生成] 回答原文：${text.replace(/\s+/g, ' ')}`, 'DEBUG', 'RAW');
+    logRun(`[生成] 回答完成：${text.length} 字 · 模型=${model} · 耗时 ${((Date.now() - gT0) / 1000).toFixed(1)}s`
+      + (earlyData ? ' · 已从页面候选锁定完整总结' : ''), 'INFO', 'GEN');
+    logRun(`[生成] 回答原文：${(earlyRaw || text).replace(/\s+/g, ' ')}`, 'DEBUG', 'RAW');
     let data = null, err = null;
-    try {
-      data = parseSummaryJson(text);
-      if (!data) err = '没能从回答里提取出 JSON 对象';
-    } catch (e) { err = String(e); }
+    if (earlyData) {
+      // pollAnswerFromDom 已从某个候选里解析出完整总结，直接用它（避免用截断的 text 重解析）
+      data = earlyData;
+      logRun(`[生成] 采用页面候选解析结果，字段：${Object.keys(data).join('、')}`, 'INFO', 'GEN');
+    } else {
+      try {
+        data = parseSummaryJson(text);
+        if (!data) err = '没能从回答里提取出 JSON 对象';
+      } catch (e) { err = String(e); }
+    }
     if (data) {
       logRun(`[生成] JSON 解析成功，字段：${Object.keys(data).join('、')}`, 'INFO', 'GEN');
       if (meta.title) data['视频标题'] = meta.title;
