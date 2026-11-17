@@ -66,20 +66,26 @@ function currentModelName() {
   return cands.length ? visibleText(cands[0]).split('\n')[0].trim() : '';
 }
 
-// 扫描浮层里所有可见、文本首行等于模型名的元素，取文本最短的（最贴近选项本身）
-function findModelOption(model) {
+// 找目标模型选项：遍历**所有**元素（不限标签），按首行精确匹配，
+// 取文本最短、面积最小的那个。返回按「命中优先级」排序的候选列表供上层逐个尝试。
+function findModelOptions(model) {
   const cands = [];
-  for (const el of $$('div, li, span, button, [role=option], [role=menuitem]')) {
+  for (const el of $$('*')) {
     const txt = visibleText(el);
-    if (!txt || txt.split('\n')[0].trim() !== model) continue;
+    if (!txt) continue;
+    // 首行精确匹配；也接受整段文本就是模型名（带箭头/图标时可能粘连）
+    const first = txt.split('\n')[0].trim();
+    if (first !== model && txt.trim() !== model) continue;
     const r = el.getBoundingClientRect();
-    if (r.width < 40 || r.height < 10 || r.top < 0) continue;
-    if (txt.length > model.length + 300) continue;   // 容器，跳过
-    cands.push({ el, len: txt.length, area: r.width * r.height });
+    if (r.width < 30 || r.height < 10) continue;
+    if (txt.length > model.length + 350) continue;    // 大容器，跳过
+    cands.push({ el, len: txt.length, area: r.width * r.height, x: r.left, y: r.top });
   }
+  // 优先文本短的；同长度优先面积小的
   cands.sort((a, b) => a.len - b.len || a.area - b.area);
-  return cands[0]?.el || null;
+  return cands;
 }
+function findModelOption(model) { return findModelOptions(model)[0]?.el || null; }
 
 // 找到并点击当前模型的触发器（打开菜单）
 async function openModelMenu() {
@@ -109,39 +115,54 @@ async function openModelMenu() {
   return false;
 }
 
-// 点击/悬停「展开更多模型」：文本可能带 ">" 或换行，用 includes 匹配
-async function expandMoreModels() {
-  const btns = $$('div, li, span, button, a').filter(e => {
+// 展开更多模型：新版是 hover 触发的二级菜单，click 可能无效。
+// 串行尝试 hover → mousemove → click，每步后都检查目标模型是否已出现。
+async function expandMoreModels(model) {
+  const btns = $$('*').filter(e => {
     const r = e.getBoundingClientRect();
     const t = visibleText(e);
-    return r.width > 40 && r.height > 10 && t.length < 30 && t.includes('展开更多模型');
+    return r.width > 40 && r.height > 10 && r.top >= 0
+      && t.length < 40 && /展开更多模型/.test(t);
   });
+  // 取最深层（文本最短）的那个，避免点到整个面板容器
   btns.sort((a, b) => visibleText(a).length - visibleText(b).length);
-  const btn = btns[0];
-  if (!btn) {
+  if (!btns.length) {
     qlog('找不到「展开更多模型」按钮', 'WARN');
     return false;
   }
-  qlog(`点「展开更多模型」：文本="${visibleText(btn)}"`);
-  btn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-  btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-  btn.click();
-  await sleep(1200);
-  return true;
+  const btn = btns[0];
+  qlog(`展开更多模型：找到 ${btns.length} 个候选，点文本="${visibleText(btn)}" 位置=${Math.round(btn.getBoundingClientRect().left)},${Math.round(btn.getBoundingClientRect().top)}`);
+  const actions = [
+    ['hover', () => {
+      btn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+      btn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+    }],
+    ['mousemove', () => btn.dispatchEvent(new MouseEvent('mousemove', { bubbles: true }))],
+    ['click', () => btn.click()],
+  ];
+  for (const [name, fn] of actions) {
+    try { fn(); } catch {}
+    await sleep(1000);
+    if (model && findModelOptions(model).length) {
+      qlog(`展开更多模型：${name} 后目标模型出现 ✅`);
+      return true;
+    }
+  }
+  qlog(`展开更多模型：三种方式都试过，目标仍未出现 · 浮层=[${dumpModelMenu()}]`, 'WARN');
+  return false;
 }
 
-// 诊断：把当前浮层里所有含 Qwen 的可见文本记下来，一次就能看出菜单到底有没有开
+// 诊断：按「去重后的模型名」列出浮层里所有可见项（不再按元素列，避免嵌套刷屏）
 function dumpModelMenu() {
-  const items = [];
-  for (const el of $$('div, li, span, button, [role=option]')) {
+  const seen = new Map();
+  for (const el of $$('*')) {
     const r = el.getBoundingClientRect();
-    const t = visibleText(el).split('\n')[0].trim();
     if (r.width < 40 || r.height < 10 || r.top < 0) continue;
-    if (!/^(Qwen|展开更多模型)/i.test(t)) continue;
-    if (t.length > 60) continue;
-    items.push(`${t.slice(0, 40)}@${Math.round(r.left)},${Math.round(r.top)}`);
+    const t = visibleText(el).split('\n')[0].trim();
+    if (!/^(Qwen|通义|展开更多模型)/i.test(t) || t.length > 60) continue;
+    if (!seen.has(t)) seen.set(t, `${t}@${Math.round(r.left)},${Math.round(r.top)}`);
   }
-  return [...new Set(items)].slice(0, 30).join(' | ');
+  return [...seen.values()].slice(0, 60).join(' | ');
 }
 
 async function ensureModel(model) {
@@ -150,27 +171,31 @@ async function ensureModel(model) {
   qlog(`切换模型：当前「${currentModelName() || '(空)'}」→ 目标「${model}」`);
   const opened = await openModelMenu();
   qlog(`模型菜单打开=${opened} · 浮层内容=[${dumpModelMenu()}]`);
-  let opt = findModelOption(model);
-  if (!opt) {
+  let cands = findModelOptions(model);
+  if (!cands.length) {
     qlog('常用列表里没找到目标模型，尝试「展开更多模型」');
-    await expandMoreModels();
+    await expandMoreModels(model);
     qlog(`展开后浮层内容=[${dumpModelMenu()}]`);
-    opt = findModelOption(model);
+    cands = findModelOptions(model);
   }
-  if (opt) {
-    qlog(`找到模型选项「${model}」（文本="${visibleText(opt).slice(0, 60)}"），点击`);
-    opt.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-    opt.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
-    opt.click();
-    await sleep(1800);
-  } else {
-    qlog(`没找到模型选项「${model}」`, 'ERROR');
+  // 逐个尝试候选（可能有父/子嵌套），点完检查触发器文本是否变了
+  let clicked = false;
+  for (const c of cands.slice(0, 6)) {
+    qlog(`尝试点击模型选项「${model}」（文本="${visibleText(c.el).slice(0, 50)}" 坐标 ${Math.round(c.x)},${Math.round(c.y)}）`);
+    c.el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+    c.el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    c.el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    c.el.click();
+    await sleep(1200);
+    if (currentModelName() === model) { clicked = true; break; }
   }
+  if (!clicked && cands.length) qlog(`点过 ${Math.min(6, cands.length)} 个候选但触发器没变`, 'WARN');
   document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
   await sleep(600);
+  // 验证：DOM 更新有延迟，多等几轮
   let actual = currentModelName();
   for (let i = 0; i < 6 && actual !== model; i++) { await sleep(500); actual = currentModelName(); }
-  if (actual !== model) throw new Error(`模型切换失败：期望「${model}」，实际「${actual}」`);
+  if (actual !== model) throw new Error(`模型切换失败：期望「${model}」，实际「${actual}」· 浮层=[${dumpModelMenu()}]`);
   qlog(`模型切换成功：${actual}`);
 }
 
